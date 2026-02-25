@@ -1,0 +1,35 @@
+[project]
+name = "esnm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13.5"
+dependencies = [
+    "fastparquet>=2025.12.0",
+    "ipython>=9.6.0",
+    "matplotlib>=3.10.7",
+    "nanobind>=2.9.2",
+    "networkx>=3.5",
+    "numba>=0.62.1",
+    "numba-stats>=1.11.0",
+    "pandas>=2.3.3",
+    "pyarrow>=22.0.0",
+    "scikit-build-core>=0.11.6",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.16.3",
+    "seaborn>=0.13.2",
+    "tqdm>=4.67.1",
+]
+
+[build-system]
+requires = [
+    "scikit-build-core>=0.11.6",
+    "nanobind>=2.9.2"
+]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+wheel.packages = ["src/"]
+wheel.py-api = "cp313"
+minimum-version = "0.11"
+build-dir = "build/{wheel_tag}"
