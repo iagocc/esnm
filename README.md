@@ -169,8 +169,6 @@ eSNM/
 │   ├── topk/
 │   ├── percentile/
 │   └── tree/
-│
-└── papers/                         # Paper materials and supplementary data
 ```
 
 ## Citation
@@ -188,4 +186,4 @@ If you use this code in your research, please cite:
 
 ## License
 
-TODO: Add license information.
+MIT
