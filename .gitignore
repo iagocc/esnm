@@ -1265,3 +1265,6 @@ dkms.conf
 *.dis
 
 .DS_Store
+
+# External baseline framework (separate repository)
+ShiftedInverse/
