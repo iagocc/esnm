@@ -30,18 +30,18 @@ struct TopTwoIndices {
     size_t second_idx;
 };
 
-// O(n) scan — replaces the previous O(n log n) full sort that only needed
-// the two largest elements.
-inline TopTwoIndices top_two_utility_indices(const Utilities& u) {
-    assert(!u.empty());
+// O(n) scan for the indices of the two largest values in v.
+// When n == 1, second_idx == max_idx (intentional fallback).
+inline TopTwoIndices top_two_indices(const std::vector<double>& v) {
+    assert(!v.empty());
 
     size_t max_idx    = 0;
-    size_t second_idx = 0;  // equals max_idx when n == 1 (intentional)
-    for (size_t i = 1; i < u.size(); ++i) {
-        if (u[i] > u[max_idx]) {
+    size_t second_idx = 0;
+    for (size_t i = 1; i < v.size(); ++i) {
+        if (v[i] > v[max_idx]) {
             second_idx = max_idx;
             max_idx    = i;
-        } else if (second_idx == max_idx || u[i] > u[second_idx]) {
+        } else if (second_idx == max_idx || v[i] > v[second_idx]) {
             second_idx = i;
         }
     }
@@ -96,8 +96,11 @@ size_t esnm_sample_argmax(
     NoiseSampler               noise_sampler
 ) {
     const size_t n = u.size();
-    const TopTwoIndices top_two        = top_two_utility_indices(u);
-    const double        smooth_s_max   = smooth_s[top_two.max_idx];
+    // Per paper: N(x, r) = (S_t(x, r) + max_{r' != r} S_t(x, r')) / s.
+    // The additive term is the max smooth sensitivity over the OTHER elements,
+    // so take the top-two by smooth sensitivity, not utility.
+    const TopTwoIndices top_two         = top_two_indices(smooth_s);
+    const double        smooth_s_max    = smooth_s[top_two.max_idx];
     const double        smooth_s_second = smooth_s[top_two.second_idx];
 
     size_t selected_idx     = 0;
@@ -206,13 +209,18 @@ Probs compute_pmf(
     const size_t R_size = (R == nullptr) ? n : R->size();
     std::vector<double> p(R_size);
 
-    // O(n) scan for top-two — replaces previous O(n log n) full sort.
-    // When n == 1, second_idx == max_idx, giving the correct fallback values.
-    const TopTwoIndices top_two     = top_two_utility_indices(u);
-    const double        sens_max    = smooth_s[top_two.max_idx];
-    const double        sens_second = smooth_s[top_two.second_idx];
-    const double        u_max       = u[top_two.max_idx];
-    const double        u_second    = u[top_two.second_idx];
+    // Two independent top-two scans:
+    //   - smooth_s top-two gives sens_r_star = max_{r' != r} S_t(x, r'),
+    //     i.e. the paper's additive noise-scale term.
+    //   - utility top-two gives u_r_star = utility of the strongest competitor,
+    //     which the integrand uses to bound the survival probability.
+    // These need not coincide on general data.
+    const TopTwoIndices top_two_s   = top_two_indices(smooth_s);
+    const TopTwoIndices top_two_u   = top_two_indices(u);
+    const double        sens_max    = smooth_s[top_two_s.max_idx];
+    const double        sens_second = smooth_s[top_two_s.second_idx];
+    const double        u_max       = u[top_two_u.max_idx];
+    const double        u_second    = u[top_two_u.second_idx];
 
     #pragma omp parallel for
     for (size_t i = 0; i < R_size; i++) {
@@ -221,9 +229,10 @@ Probs compute_pmf(
 
         gsl_integration_workspace* w = gsl_integration_workspace_alloc(1000);
 
-        const bool   is_max      = (top_two.max_idx == r);
-        const double sens_r_star = is_max ? sens_second : sens_max;
-        const double u_r_star    = is_max ? u_second    : u_max;
+        const bool   is_sens_max = (top_two_s.max_idx == r);
+        const bool   is_u_max    = (top_two_u.max_idx == r);
+        const double sens_r_star = is_sens_max ? sens_second : sens_max;
+        const double u_r_star    = is_u_max    ? u_second    : u_max;
 
         integrand_params params;
         params.u           = &u;
