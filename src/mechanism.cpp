@@ -203,7 +203,7 @@ Probs compute_pmf(
     const char*                mechanism_name,
     const std::vector<size_t>* R      = nullptr,
     double                     epsabs = 0,
-    double                     epsrel = 1e-7
+    double                     epsrel = 1e-5
 ) {
     const size_t n      = u.size();
     const size_t R_size = (R == nullptr) ? n : R->size();
@@ -222,42 +222,80 @@ Probs compute_pmf(
     const double        u_max       = u[top_two_u.max_idx];
     const double        u_second    = u[top_two_u.second_idx];
 
-    #pragma omp parallel for
-    for (size_t i = 0; i < R_size; i++) {
-        // When R is provided, use the actual element index; otherwise i itself.
-        const size_t r = (R == nullptr) ? i : R->at(i);
+    // The default workspace size 1000 is exhausted on sharply-peaked
+    // integrands (LLN at small sigma, i.e. large epsilon). Quadruple it,
+    // and run a one-shot looser-tolerance retry when the tight call fails.
+    constexpr size_t WS_LIMIT     = 4096;
+    constexpr double EPSREL_LOOSE = 1e-3;
 
-        gsl_integration_workspace* w = gsl_integration_workspace_alloc(1000);
+    // Far-from-best fast-path: for outcomes whose utility is so much below
+    // u_r_star that the survival is numerically zero across the whole pdf
+    // support, skip integration entirely and assign a sub-normal probability.
+    // The LLN survival drops to ~e^{-x} (heavy Laplace tails), so a
+    // scaled gap of 30 puts survival below 1e-13.
+    constexpr double SKIP_THRESHOLD = 30.0;
+    constexpr double SKIP_PROB      = 1e-300;
 
-        const bool   is_sens_max = (top_two_s.max_idx == r);
-        const bool   is_u_max    = (top_two_u.max_idx == r);
-        const double sens_r_star = is_sens_max ? sens_second : sens_max;
-        const double u_r_star    = is_u_max    ? u_second    : u_max;
+    // One workspace per OMP thread, reused across iterations.
+    // gsl_integration_qagi reinitialises the workspace on each call.
+    #pragma omp parallel
+    {
+        gsl_integration_workspace* w = gsl_integration_workspace_alloc(WS_LIMIT);
 
-        integrand_params params;
-        params.u           = &u;
-        params.sens        = &smooth_s;
-        params.r           = r;
-        params.s_values    = &s_values;
-        params.sigmas      = sigmas;
-        params.df          = df;
-        params.sens_r_star = sens_r_star;
-        params.u_r_star    = u_r_star;
+        #pragma omp for
+        for (size_t i = 0; i < R_size; i++) {
+            // When R is provided, use the actual element index; otherwise i itself.
+            const size_t r = (R == nullptr) ? i : R->at(i);
 
-        gsl_function F;
-        F.function = integrand;
-        F.params   = &params;
+            const bool   is_sens_max = (top_two_s.max_idx == r);
+            const bool   is_u_max    = (top_two_u.max_idx == r);
+            const double sens_r_star = is_sens_max ? sens_second : sens_max;
+            const double u_r_star    = is_u_max    ? u_second    : u_max;
 
-        double     result, error;
-        const int  status = gsl_integration_qagi(&F, epsabs, epsrel, 1000, w,
-                                                  &result, &error);
-        if (status != GSL_SUCCESS) {
-            std::fprintf(stderr,
-                         "GSL integration for %s Mechanism failed: %s\n",
-                         mechanism_name, gsl_strerror(status));
+            // Cheap shortcut for outcomes whose integrand is numerically zero.
+            const double scale_r = (smooth_s[r] + sens_r_star) / s_values[r];
+            if (std::isfinite(scale_r) && scale_r > 0.0) {
+                const double scaled_gap = (u_r_star - u[r]) / scale_r;
+                if (scaled_gap > SKIP_THRESHOLD) {
+                    p[i] = SKIP_PROB;
+                    continue;
+                }
+            }
+
+            integrand_params params;
+            params.u           = &u;
+            params.sens        = &smooth_s;
+            params.r           = r;
+            params.s_values    = &s_values;
+            params.sigmas      = sigmas;
+            params.df          = df;
+            params.sens_r_star = sens_r_star;
+            params.u_r_star    = u_r_star;
+
+            gsl_function F;
+            F.function = integrand;
+            F.params   = &params;
+
+            double result, error;
+            int status = gsl_integration_qagi(&F, epsabs, epsrel, WS_LIMIT, w,
+                                              &result, &error);
+            if (status != GSL_SUCCESS) {
+                status = gsl_integration_qagi(&F, epsabs, EPSREL_LOOSE, WS_LIMIT, w,
+                                              &result, &error);
+            }
+            if (status != GSL_SUCCESS) {
+                const double relerr = (std::abs(result) > 0.0)
+                                      ? error / std::abs(result)
+                                      : error;
+                std::fprintf(stderr,
+                             "GSL %s integration failed at outcome %zu: %s "
+                             "(relerr=%.2e)\n",
+                             mechanism_name, r, gsl_strerror(status), relerr);
+            }
+
+            p[i] = result;
         }
 
-        p[i] = result;
         gsl_integration_workspace_free(w);
     }
 
@@ -315,6 +353,14 @@ size_t esnm_t(
 }
 
 NB_MODULE(mechanism, m) {
+    // Disable GSL's default abort-on-error handler. Without this, transient
+    // integration roundoff in compute_pmf (e.g. on very concentrated noise
+    // at large epsilon) terminates the Python process. compute_pmf already
+    // inspects the return status and reports failures to stderr, then
+    // leaves the entry as the partial integrator result — finite-but-noisy,
+    // which the caller renormalises.
+    gsl_set_error_handler_off();
+
     m.def("esnm_t_pmf",
           [](const Utilities& u, const std::vector<double>& smooth_s,
              const std::vector<double>& s_values, double df) -> Probs {
