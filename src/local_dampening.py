@@ -63,9 +63,11 @@ def dampening_func(u: np.ndarray, r: int, gs: float, ls: np.ndarray) -> float:
         delta_t = ls[r, t] if t < K else gs
         btp = bt + delta_t  # b(t+1) = b(t) + delta(t)
 
-        # Check if sensitivity has converged to global sensitivity
+        # Check if sensitivity has converged to global sensitivity.
+        # From here on delta = gs, so b(i) = bt + (i-t)*gs for i >= t,
+        # and per Definition 12, D = (u_r - bt)/gs + t.
         if delta_t >= gs - err or delta_t == 0:
-            return ((u_r - bt) / gs) * sign
+            return ((u_r - bt) / gs + t) * sign
 
         # Check if u_r is in interval [b(t), b(t+1))
         if u_r >= bt and u_r < btp:
@@ -76,7 +78,7 @@ def dampening_func(u: np.ndarray, r: int, gs: float, ls: np.ndarray) -> float:
 
         # Safety bound
         if t > K:
-            return ((u_r - bt) / gs) * sign
+            return ((u_r - bt) / gs + t) * sign
 
     return (((u_r - bt) / (btp - bt)) + t) * sign
 
@@ -178,6 +180,113 @@ def _compute_shifted_dampened_utilities(
     return dampened
 
 
+# ---------------------------------------------------------------------------
+# Shared-LS variants
+# ---------------------------------------------------------------------------
+# When every outcome shares the same LS curve (e.g. percentile / quantile
+# selection where LS depends on x but not on the output value), materialising
+# an (R, K) matrix costs O(R·K) memory for no information gain. The kernels
+# below accept a length-K 1D curve and read it directly per outcome.
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def _dampening_func_shared(u_r: float, gs: float, ls_1d: np.ndarray) -> float:
+    err = 1e-12
+    sign = 1.0
+    if u_r < 0:
+        sign = -1.0
+        u_r = -u_r
+
+    K = ls_1d.shape[0]
+    t = 0
+    bt = 0.0
+
+    while True:
+        delta_t = ls_1d[t] if t < K else gs
+        btp = bt + delta_t
+
+        if delta_t >= gs - err or delta_t == 0:
+            return ((u_r - bt) / gs + t) * sign
+
+        if u_r >= bt and u_r < btp:
+            break
+
+        t += 1
+        bt = btp
+
+        if t > K:
+            return ((u_r - bt) / gs + t) * sign
+
+    return (((u_r - bt) / (btp - bt)) + t) * sign
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def _shifted_dampening_func_shared(
+    u_r: float, gs: float, ls_1d: np.ndarray, shift: float
+) -> float:
+    err = 1e-12
+    K = ls_1d.shape[0]
+
+    u_shifted = u_r - shift
+
+    t = 0
+    bt = 0.0
+
+    while u_shifted < bt:
+        neg_t = -t
+        delta = ls_1d[neg_t] if neg_t < K else gs
+
+        t -= 1
+        bt_prev = bt
+        bt = bt - delta
+
+        interval_width = bt_prev - bt
+        if interval_width >= gs - err:
+            remaining = bt - u_shifted
+            additional_steps = remaining / gs
+            return float(t) - additional_steps
+
+    if t < 0:
+        neg_t_minus_1 = -t - 1
+        delta = ls_1d[neg_t_minus_1] if neg_t_minus_1 < K else gs
+        btp = bt + delta
+    else:
+        delta = ls_1d[0] if K > 0 else gs
+        btp = bt + delta
+
+    interval_width = btp - bt
+
+    if abs(interval_width) < err:
+        return float(t)
+
+    if interval_width >= gs - err:
+        return ((u_shifted - bt) / gs) + t
+
+    return ((u_shifted - bt) / interval_width) + t
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _compute_dampened_utilities_shared(
+    u: np.ndarray, gs: float, ls_1d: np.ndarray
+) -> np.ndarray:
+    n = len(u)
+    dampened = np.empty(n, dtype=np.float64)
+    for r in prange(n):
+        dampened[r] = _dampening_func_shared(u[r], gs, ls_1d)
+    return dampened
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _compute_shifted_dampened_utilities_shared(
+    u: np.ndarray, gs: float, ls_1d: np.ndarray, shift: float
+) -> np.ndarray:
+    n = len(u)
+    dampened = np.empty(n, dtype=np.float64)
+    for r in prange(n):
+        dampened[r] = _shifted_dampening_func_shared(u[r], gs, ls_1d, shift)
+    return dampened
+
+
 def ld_pmf(u: np.ndarray, gs: float, eps: float, ls: np.ndarray):
     """Compute probability mass function using local dampening.
 
@@ -185,7 +294,9 @@ def ld_pmf(u: np.ndarray, gs: float, eps: float, ls: np.ndarray):
         u: Utility scores
         gs: Global sensitivity
         eps: Privacy budget
-        ls: Local sensitivity matrix [r, k]
+        ls: Local sensitivity. Either a 2D matrix of shape (R, K) where
+            ls[r, k] is per-outcome, or a 1D curve of length K shared
+            across all outcomes.
 
     Returns:
         PMF over elements
@@ -194,7 +305,10 @@ def ld_pmf(u: np.ndarray, gs: float, eps: float, ls: np.ndarray):
         u = np.ascontiguousarray(u, dtype=np.float64)
     if not ls.flags["C_CONTIGUOUS"]:
         ls = np.ascontiguousarray(ls, dtype=np.float64)
-    dampened_u = _compute_dampened_utilities(u, gs, ls)
+    if ls.ndim == 1:
+        dampened_u = _compute_dampened_utilities_shared(u, gs, ls)
+    else:
+        dampened_u = _compute_dampened_utilities(u, gs, ls)
     # Use numpy for PMF computation (fast)
     dampened_u = dampened_u - dampened_u.max()
     scores = np.exp((dampened_u * eps) / 2.0)
@@ -234,7 +348,9 @@ def shifted_ld_pmf(
         u: Utility scores
         gs: Global sensitivity
         eps: Privacy budget
-        ls: Local sensitivity matrix [r, k]
+        ls: Local sensitivity. Either a 2D matrix of shape (R, K) where
+            ls[r, k] is per-outcome, or a 1D curve of length K shared
+            across all outcomes.
         shift: Shift amount. If None, computed as n * gs + max(u)
 
     Returns:
@@ -247,7 +363,10 @@ def shifted_ld_pmf(
     if shift is None:
         shift = len(u) * gs + u.max()
 
-    dampened_u = _compute_shifted_dampened_utilities(u, gs, ls, shift)
+    if ls.ndim == 1:
+        dampened_u = _compute_shifted_dampened_utilities_shared(u, gs, ls, shift)
+    else:
+        dampened_u = _compute_shifted_dampened_utilities(u, gs, ls, shift)
     # Use numpy for PMF computation (fast)
     dampened_u = dampened_u - dampened_u.max()
     scores = np.exp((dampened_u * eps) / 2.0)
@@ -313,7 +432,7 @@ def dampening_func_from_ls_func(
         btp = b_from_ls_func(u_r, t + 1, r, ls_func)
 
         if btp - bt >= gs - err or btp - bt == 0:
-            return ((u_r - bt) / gs) * sign
+            return ((u_r - bt) / gs + t) * sign
 
         if u_r >= bt and u_r < btp:
             break
