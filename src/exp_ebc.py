@@ -1,7 +1,35 @@
 """Influential Node Analysis - Section 6.5 of Local Dampening paper.
 
 This script implements the EBC (Egocentric Betweenness Centrality) experiments
-using various differentially private mechanisms for top-k selection.
+comparing differentially private top-k selection mechanisms at a common
+**rho-zCDP** budget. Every mechanism here is a *peeling* top-k: it selects one
+node at a time, and after each pick the chosen node is dropped so the next round
+selects from the reduced set of remaining candidates.
+
+The sweep variable `rho` is the total rho-zCDP budget for one top-k call, split
+evenly as rho/k per peeling round. Per-method conversions:
+
+  * `report_noisy_max`, `shifted_ld` (pure eps-DP, peeling):
+    per-iteration eps = sqrt(2 * (rho / k)) via
+    `src/dp_conv.py::rho_zcdp_to_eps_for_pure_dp`. By Lemma 9 of Bun & Steinke,
+    each call is (rho/k)-zCDP; zCDP composes additively over k peeling rounds.
+  * eSNM-T (peeling): Student's-T smooth-sensitivity noise is *pure eps-DP*
+    (Bun & Steinke 2019, Thm 31 -- polynomial tails, like Cauchy), so the
+    optimizer receives eps = sqrt(2 * (rho / k)) and the round is (rho/k)-zCDP
+    by the pure-DP => (1/2 eps^2)-zCDP bound (Bun & Steinke 2016).
+  * eSNM-LLN (peeling): Laplace-log-normal noise is NOT pure-DP -- it is
+    directly (1/2 eps^2)-CDP (Bun & Steinke 2019, Prop. 3). Since (1/2 eps^2)-CDP
+    equals rho-zCDP with rho = eps^2/2, the optimizer receives the *same*
+    eps = sqrt(2 * (rho / k)), but for the CDP-native reason.
+    Each round runs the mechanism on the reduced candidate set. Because the
+    optimizer is strictly per-candidate (a node's parameters depend only on its
+    own local-sensitivity row and the budget), parameters are computed once per
+    per-round eps over all nodes and sliced to the surviving candidates -- this
+    is identical to re-optimizing on the reduced set, but avoids k optimizer calls.
+
+All five mechanisms therefore spend exactly rho-zCDP per top-k call (k rounds of
+(rho/k)-zCDP, composed by Lemma 9 of Bun & Steinke), so accuracy at a fixed rho
+is a fair head-to-head comparison.
 """
 
 import random
@@ -10,8 +38,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from esnm.mechanism import esnm_lln, esnm_lln_topk, esnm_t, esnm_t_topk
+from esnm.mechanism import esnm_lln, esnm_t
 
+from dp_conv import rho_zcdp_to_cdp_eps, rho_zcdp_to_eps_for_pure_dp
 from ebc import (
     adj_list_to_numba,
     build_ls_matrix,
@@ -30,17 +59,6 @@ def set_seeds(seed: int) -> None:
     """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
-
-
-def get_rho_from_approx_dp(target_epsilon: float, target_delta: float) -> float:
-    """Calculate zCDP rho from approximate DP (epsilon, delta).
-
-    Formula from Bun & Steinke (2016): epsilon = rho + 2*sqrt(rho * ln(1/delta))
-    """
-    log_inv_delta = np.log(1 / target_delta)
-    term1 = np.sqrt(log_inv_delta + target_epsilon)
-    term2 = np.sqrt(log_inv_delta)
-    return (term1 - term2) ** 2
 
 
 def load_or_compute_ebc(
@@ -88,8 +106,6 @@ def load_or_compute_ebc(
 
 class SelectionMethod:
     """Base class for selection methods."""
-
-    is_oneshot: bool = False
 
     def __call__(self, u: np.ndarray, selected_mask: np.ndarray) -> int:
         """Select a single element.
@@ -159,43 +175,42 @@ class ShiftedLocalDampening(SelectionMethod):
 
 
 class ESNMParamsCache:
-    """Cache for ESNM optimized parameters.
+    """Cache for ESNM optimized parameters keyed on the per-round epsilon.
 
-    Pre-computes parameters for each epsilon value to avoid redundant computation.
+    A (rho/k)-zCDP round uses eps = sqrt(2 * rho/k) for both noise families:
+    Student's-T is pure-eps-DP (=> (1/2 eps^2)-zCDP) and LLN is directly
+    (1/2 eps^2)-CDP, so the two map to the *same* eps. Parameters are
+    per-candidate, so caching one full-node optimization per eps lets each
+    round slice the surviving candidates.
     """
 
     def __init__(
         self,
         local_sensitivity: np.ndarray,
-        eps_values: np.ndarray,
-        precompute_oneshot: bool = False,
+        rho_values: np.ndarray,
+        k_values: list[int],
     ):
         self.local_sensitivity = local_sensitivity
         self._cache_t: dict[float, tuple] = {}
         self._cache_lln: dict[float, tuple] = {}
-        self._cache_t_oneshot: dict[float, tuple] = {}
-        self._cache_lln_oneshot: dict[float, tuple] = {}
 
-        # Pre-compute parameters for all epsilon values
+        # Each (rho/k)-zCDP peeling round uses pure-DP eps = sqrt(2 * rho/k).
+        per_call_eps: set[float] = {
+            rho_zcdp_to_eps_for_pure_dp(float(rho) / int(k))
+            for rho in rho_values
+            for k in k_values
+        }
+
         print("  Pre-computing ESNM-T parameters...")
-        for eps in eps_values:
+        for eps in sorted(per_call_eps):
             self._compute_t_params(eps)
 
         print("  Pre-computing ESNM-LLN parameters...")
-        for eps in eps_values:
+        for eps in sorted(per_call_eps):
             self._compute_lln_params(eps)
 
-        if precompute_oneshot:
-            print("  Pre-computing ESNM-T one-shot parameters...")
-            for eps in eps_values:
-                self._compute_t_params_oneshot(eps)
-
-            print("  Pre-computing ESNM-LLN one-shot parameters...")
-            for eps in eps_values:
-                self._compute_lln_params_oneshot(eps)
-
     def _compute_t_params(self, eps: float) -> None:
-        """Compute and cache ESNM-T parameters for given epsilon."""
+        """Compute and cache ESNM-T parameters for given per-round pure-DP eps."""
         if eps in self._cache_t:
             return
 
@@ -211,7 +226,7 @@ class ESNMParamsCache:
         )
 
     def _compute_lln_params(self, eps: float) -> None:
-        """Compute and cache ESNM-LLN parameters for given epsilon."""
+        """Compute and cache ESNM-LLN parameters for given per-round pure-DP eps."""
         if eps in self._cache_lln:
             return
 
@@ -227,167 +242,69 @@ class ESNMParamsCache:
         )
 
     def get_t_params(self, eps: float) -> tuple:
-        """Get cached ESNM-T parameters."""
+        """Get cached ESNM-T parameters for per-round pure-DP eps."""
         if eps not in self._cache_t:
             self._compute_t_params(eps)
         return self._cache_t[eps]
 
     def get_lln_params(self, eps: float) -> tuple:
-        """Get cached ESNM-LLN parameters."""
+        """Get cached ESNM-LLN parameters for per-round pure-DP eps."""
         if eps not in self._cache_lln:
             self._compute_lln_params(eps)
         return self._cache_lln[eps]
 
-    def _compute_t_params_oneshot(self, eps: float) -> None:
-        """Compute and cache ESNM-T one-shot parameters (full epsilon)."""
-        if eps in self._cache_t_oneshot:
-            return
-
-        degree_freedom = 3
-        t_candidates = np.linspace(0, eps / (degree_freedom + 1), 150)
-        t, s, _, ss = optimize_params_tdist(
-            eps, degree_freedom, t_candidates, self.local_sensitivity
-        )
-        self._cache_t_oneshot[eps] = (
-            np.ascontiguousarray(t),
-            np.ascontiguousarray(s),
-            np.ascontiguousarray(ss),
-        )
-
-    def _compute_lln_params_oneshot(self, eps: float) -> None:
-        """Compute and cache ESNM-LLN one-shot parameters (full epsilon)."""
-        if eps in self._cache_lln_oneshot:
-            return
-
-        t_candidates = np.logspace(-9, 10, 150)
-        t, sigmas, s, _, ss = optimize_params_lln(
-            eps, t_candidates, self.local_sensitivity
-        )
-        self._cache_lln_oneshot[eps] = (
-            np.ascontiguousarray(t),
-            np.ascontiguousarray(sigmas),
-            np.ascontiguousarray(s),
-            np.ascontiguousarray(ss),
-        )
-
-    def get_t_params_oneshot(self, eps: float) -> tuple:
-        """Get cached ESNM-T one-shot parameters."""
-        if eps not in self._cache_t_oneshot:
-            self._compute_t_params_oneshot(eps)
-        return self._cache_t_oneshot[eps]
-
-    def get_lln_params_oneshot(self, eps: float) -> tuple:
-        """Get cached ESNM-LLN one-shot parameters."""
-        if eps not in self._cache_lln_oneshot:
-            self._compute_lln_params_oneshot(eps)
-        return self._cache_lln_oneshot[eps]
-
 
 class Selection_ESNM_T(SelectionMethod):
-    """ESNM-T selection mechanism with cached parameters."""
+    """ESNM-T peeling selection (pure eps-DP per round).
 
-    def __init__(self, cache: ESNMParamsCache, eps: float, k: int):
-        t, s, ss = cache.get_t_params(eps)
-        self.eps = eps / k
-        self.t = t
-        self.s = s
-        self.ss = ss
+    A (rho/k)-zCDP round uses pure-DP eps = sqrt(2 * rho/k); k rounds compose to
+    rho-zCDP. Each round selects over the reduced set of unselected candidates;
+    the per-candidate parameters are precomputed once over all nodes (for this
+    per-round eps) and sliced to the surviving candidates, then mapped back.
+    """
+
+    def __init__(self, cache: ESNMParamsCache, rho: float, k: int):
+        # Student's-T is pure-eps-DP; eps = sqrt(2 rho/k) => (rho/k)-zCDP.
+        _, s, ss = cache.get_t_params(rho_zcdp_to_eps_for_pure_dp(rho / k))
+        self.s = np.ascontiguousarray(s)
+        self.ss = np.ascontiguousarray(ss)
 
     def __call__(self, u: np.ndarray, selected_mask: np.ndarray) -> int:
-        # Mask out already selected elements
-        u_masked = u.copy()
-        u_masked[selected_mask] = -np.inf
+        valid_indices = np.where(~selected_mask)[0]
+        u_valid = np.ascontiguousarray(u[valid_indices])
+        s_valid = np.ascontiguousarray(self.s[valid_indices])
+        ss_valid = np.ascontiguousarray(self.ss[valid_indices])
 
-        selected_idx = esnm_t(
-            np.ascontiguousarray(u_masked),
-            self.ss.copy(),
-            self.s.copy(),
-            3.0,
-        )
-        return selected_idx
+        selected = esnm_t(u_valid, ss_valid, s_valid, 3.0)
+        return valid_indices[selected]
 
 
 class Selection_ESNM_LLN(SelectionMethod):
-    """ESNM-LLN selection mechanism with cached parameters."""
+    """ESNM-LLN peeling selection ((1/2 eps^2)-CDP per round).
 
-    def __init__(self, cache: ESNMParamsCache, eps: float, delta: float, k: int):
-        t, sigmas, s, ss = cache.get_lln_params(eps)
+    LLN noise is not pure-DP; it is directly (1/2 eps^2)-CDP (Bun & Steinke 2019,
+    Prop. 3), which equals (rho/k)-zCDP at eps = sqrt(2 * rho/k); k rounds compose
+    to rho-zCDP. Each round selects over the reduced set of unselected candidates;
+    the per-candidate parameters are precomputed once over all nodes (for this
+    per-round eps) and sliced to the surviving candidates, then mapped back.
+    """
 
-        # Convert to zCDP
-        log_d = np.log(1 / delta)
-        self.eps = np.max(
-            [
-                eps / k,
-                (np.sqrt(2) / np.sqrt(k)) * (np.sqrt(eps + log_d) - np.sqrt(log_d)),
-            ]
-        )
-        self.t = t
-        self.s = s
-        self.ss = ss
-        self.sigma = sigmas
+    def __init__(self, cache: ESNMParamsCache, rho: float, k: int):
+        # LLN is (1/2 eps^2)-CDP (not pure-DP); eps = sqrt(2 rho/k) => (rho/k)-zCDP.
+        _, sigmas, s, ss = cache.get_lln_params(rho_zcdp_to_cdp_eps(rho / k))
+        self.s = np.ascontiguousarray(s)
+        self.ss = np.ascontiguousarray(ss)
+        self.sigma = np.ascontiguousarray(sigmas)
 
     def __call__(self, u: np.ndarray, selected_mask: np.ndarray) -> int:
-        # Mask out already selected elements
-        u_masked = u.copy()
-        u_masked[selected_mask] = -np.inf
+        valid_indices = np.where(~selected_mask)[0]
+        u_valid = np.ascontiguousarray(u[valid_indices])
+        s_valid = np.ascontiguousarray(self.s[valid_indices])
+        ss_valid = np.ascontiguousarray(self.ss[valid_indices])
+        sigma_valid = np.ascontiguousarray(self.sigma[valid_indices])
 
-        selected_idx = esnm_lln(
-            np.ascontiguousarray(u_masked),
-            self.ss.copy(),
-            self.s.copy(),
-            self.sigma.copy(),
-        )
-        return selected_idx
-
-
-class Selection_ESNM_T_Oneshot(SelectionMethod):
-    """ESNM-T one-shot selection mechanism for top-k."""
-
-    is_oneshot = True
-
-    def __init__(self, cache: ESNMParamsCache, eps: float):
-        t, s, ss = cache.get_t_params_oneshot(eps)
-        self.eps = eps  # Full epsilon, NO division by k
-        self.t = t
-        self.s = s
-        self.ss = ss
-
-    def select_topk(self, u: np.ndarray, k: int) -> np.ndarray:
-        """Select top-k elements in one shot."""
-        selected_indices = esnm_t_topk(
-            np.ascontiguousarray(u),
-            self.ss.copy(),
-            self.s.copy(),
-            3.0,
-            k,
-        )
-        return np.array(selected_indices, dtype=np.int64)
-
-
-class Selection_ESNM_LLN_Oneshot(SelectionMethod):
-    """ESNM-LLN one-shot selection mechanism for top-k."""
-
-    is_oneshot = True
-
-    def __init__(self, cache: ESNMParamsCache, eps: float, delta: float):
-        t, sigmas, s, ss = cache.get_lln_params_oneshot(eps)
-        # Convert to zCDP rho (NO division by k for one-shot)
-        self.eps = get_rho_from_approx_dp(eps, delta)
-        self.t = t
-        self.s = s
-        self.ss = ss
-        self.sigma = sigmas
-
-    def select_topk(self, u: np.ndarray, k: int) -> np.ndarray:
-        """Select top-k elements in one shot."""
-        selected_indices = esnm_lln_topk(
-            np.ascontiguousarray(u),
-            self.ss.copy(),
-            self.s.copy(),
-            self.sigma.copy(),
-            k,
-        )
-        return np.array(selected_indices, dtype=np.int64)
+        selected = esnm_lln(u_valid, ss_valid, s_valid, sigma_valid)
+        return valid_indices[selected]
 
 
 def priv_topk(
@@ -405,10 +322,6 @@ def priv_topk(
     Returns:
         Array of indices of selected top-k nodes.
     """
-    # One-shot methods select all k elements at once
-    if method.is_oneshot:
-        return method.select_topk(ebc_scores, k)
-
     # Peeling: iteratively select k nodes
     n = len(ebc_scores)
     selected = np.zeros(k, dtype=np.int64)
@@ -443,7 +356,7 @@ def run_experiment_for_dataset(
     data_dir: Path,
     results_dir: Path,
     k_values: list[int],
-    eps_values: np.ndarray,
+    rho_values: np.ndarray,
     n_runs: int,
 ) -> None:
     """Run EBC experiments for a single dataset.
@@ -453,7 +366,7 @@ def run_experiment_for_dataset(
         data_dir: Directory containing graph files.
         results_dir: Directory to save results.
         k_values: List of k values to test.
-        eps_values: Array of epsilon values to test.
+        rho_values: Array of rho-zCDP budgets to test.
         n_runs: Number of runs per configuration.
     """
     print(f"\n{'=' * 60}")
@@ -480,28 +393,30 @@ def run_experiment_for_dataset(
     max_distance = 100
     ls_matrix = build_ls_matrix(degrees, max_distance)
 
-    # Pre-compute ESNM parameters for all epsilon values (major speedup)
+    # Pre-compute ESNM parameters for every per-round pure-DP eps the experiment
+    # needs (each (rho/k)-zCDP peeling round uses eps = sqrt(2 * rho/k)).
     print("Pre-computing ESNM parameters...")
-    esnm_cache = ESNMParamsCache(ls_matrix, eps_values, precompute_oneshot=True)
+    esnm_cache = ESNMParamsCache(ls_matrix, rho_values, k_values)
 
     # Get true top-k for each k
     true_topk_dict = {}
     for k in k_values:
         true_topk_dict[k] = np.argsort(ebc_scores)[::-1][:k]
 
-    # Methods to test
+    # Methods to test. `rho` is the total rho-zCDP budget for one top-k call.
+    # Every method spends pure-DP eps = sqrt(2 * rho/k) per peeling round, so each
+    # round is (rho/k)-zCDP and the k rounds compose to exactly rho-zCDP -- an
+    # equal-budget head-to-head comparison.
     methods_config = {
-        "rnm": lambda eps, k: RNM(eps=eps / k, gs=gs),
-        # "ld": lambda eps, k: LocalDampening(eps=eps / k, gs=gs, ls=ls_matrix),
-        "shifted_ld": lambda eps, k: ShiftedLocalDampening(
-            eps=eps / k, gs=gs, ls=ls_matrix
-        ),
-        "esnm_t": lambda eps, k: Selection_ESNM_T(esnm_cache, eps, k),
-        "esnm_lln": lambda eps, k: Selection_ESNM_LLN(esnm_cache, eps, delta=1e-6, k=k),
-        "esnm_t_oneshot": lambda eps, k: Selection_ESNM_T_Oneshot(esnm_cache, eps),
-        "esnm_lln_oneshot": lambda eps, k: Selection_ESNM_LLN_Oneshot(
-            esnm_cache, eps, delta=1e-6
-        ),
+        # "rnm": lambda rho, k: RNM(eps=rho_zcdp_to_eps_for_pure_dp(rho / k), gs=gs),
+        # "ld": lambda rho, k: LocalDampening(
+        #     eps=rho_zcdp_to_eps_for_pure_dp(rho / k), gs=gs, ls=ls_matrix
+        # ),
+        # "shifted_ld": lambda rho, k: ShiftedLocalDampening(
+        #     eps=rho_zcdp_to_eps_for_pure_dp(rho / k), gs=gs, ls=ls_matrix
+        # ),
+        "esnm_t": lambda rho, k: Selection_ESNM_T(esnm_cache, rho, k),
+        "esnm_lln": lambda rho, k: Selection_ESNM_LLN(esnm_cache, rho, k),
     }
 
     for method_name, method_factory in methods_config.items():
@@ -509,18 +424,18 @@ def run_experiment_for_dataset(
         result_file = results_dir / f"{dataset_name}_{method_name}.txt"
 
         with open(result_file, "w") as f:
-            print("method\tk\teps\tmean_acc\tstd_acc\tmean_time", file=f)
+            print("method\tk\trho\tmean_acc\tstd_acc\tmean_time", file=f)
 
             for k in k_values:
                 true_topk = true_topk_dict[k]
 
-                for eps in eps_values:
+                for rho in rho_values:
                     accuracies = []
                     times = []
 
                     for run in range(n_runs):
                         try:
-                            method = method_factory(eps, k)
+                            method = method_factory(rho, k)
 
                             start_time = time.perf_counter()
                             predicted_topk = priv_topk(ebc_scores, k, method)
@@ -530,7 +445,7 @@ def run_experiment_for_dataset(
                             accuracies.append(acc)
                             times.append(elapsed)
                         except Exception as e:
-                            print(f"  Error at eps={eps:.2e}, k={k}: {e}")
+                            print(f"  Error at rho={rho:.2e}, k={k}: {e}")
                             break
 
                     if accuracies:
@@ -539,11 +454,11 @@ def run_experiment_for_dataset(
                         mean_time = np.mean(times)
 
                         print(
-                            f"{method_name}\t{k}\t{eps:.2e}\t{mean_acc:.4f}\t{std_acc:.4f}\t{mean_time:.4f}",
+                            f"{method_name}\t{k}\t{rho:.2e}\t{mean_acc:.4f}\t{std_acc:.4f}\t{mean_time:.4f}",
                             file=f,
                         )
                         print(
-                            f"  k={k}, eps={eps:.2e}: acc={mean_acc:.4f} ± {std_acc:.4f}"
+                            f"  k={k}, rho={rho:.2e}: acc={mean_acc:.4f} ± {std_acc:.4f}"
                         )
 
         print(f"  Results saved to {result_file}")
@@ -556,13 +471,13 @@ def main():
     # Datasets to process
     datasets = [
         "enron",
-        # "dblp",
-        # "github",
+        "dblp",
+        "github",
     ]
 
     # Experiment parameters
     k_values = [10, 50, 100]
-    eps_values = np.logspace(-3, 4, num=20)
+    rho_values = np.logspace(-3, 4, num=20)
     n_runs = 10
 
     # Directories
@@ -579,7 +494,7 @@ def main():
             data_dir=data_dir,
             results_dir=results_dir,
             k_values=k_values,
-            eps_values=eps_values,
+            rho_values=rho_values,
             n_runs=n_runs,
         )
 

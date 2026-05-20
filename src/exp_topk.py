@@ -1,3 +1,21 @@
+"""Top-k mechanisms compared at a common rho-zCDP budget.
+
+The sweep variable `rho` is the rho-zCDP budget. Conversions per method:
+
+  * `joint_mechanism` (pure eps-DP, one-shot): receives
+    eps = sqrt(2*rho) via `src/dp_conv.py::rho_zcdp_to_eps_for_pure_dp`
+    (Lemma 9 of Bun & Steinke: pure-eps-DP implies (1/2)*eps^2-CDP).
+  * `esnm_joint_t` (one-shot): Student's-T noise is pure eps-DP (Bun & Steinke
+    2019, Thm 31), so it receives eps = sqrt(2*rho) via
+    `rho_zcdp_to_eps_for_pure_dp`; the call is rho-zCDP by pure-DP =>
+    (1/2 eps^2)-zCDP.
+  * `esnm_joint_lln` (one-shot): LLN noise is NOT pure-DP -- it is directly
+    (1/2 eps^2)-CDP (Prop. 3), which equals rho-zCDP at the same
+    eps = sqrt(2*rho) via `rho_zcdp_to_cdp_eps`.
+
+The `rho` column in the TSV is the rho-zCDP axis.
+"""
+
 import multiprocessing as mp
 import random
 import time
@@ -7,6 +25,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import ndcg_score
 
+from dp_conv import rho_zcdp_to_cdp_eps, rho_zcdp_to_eps_for_pure_dp
 from topk.esnm_joint import esnm_joint_lln, esnm_joint_t
 from topk.joint import joint_mechanism
 
@@ -52,17 +71,21 @@ def compute_errors(
 # ---------------------------------------------------------------------------
 
 
-def run_joint(counts, k, eps):
-    selected = joint_mechanism(counts, eps, k)
+def run_joint(counts, k, rho):
+    selected = joint_mechanism(counts, rho_zcdp_to_eps_for_pure_dp(rho), k)
     return counts[selected]
 
 
-def run_esnm_joint_t(counts, k, eps):
+def run_esnm_joint_t(counts, k, rho):
+    # eSNM optimizer budget is a pure-DP epsilon; sqrt(2*rho) makes it rho-zCDP.
+    eps = rho_zcdp_to_eps_for_pure_dp(rho)
     selected = esnm_joint_t(counts, eps, k, degree_freedom=5.0)
     return counts[selected]
 
 
-def run_esnm_joint_lln(counts, k, eps):
+def run_esnm_joint_lln(counts, k, rho):
+    # LLN is (1/2 eps^2)-CDP (not pure-DP); eps = sqrt(2*rho) => rho-zCDP.
+    eps = rho_zcdp_to_cdp_eps(rho)
     selected = esnm_joint_lln(counts, eps, k)
     return counts[selected]
 
@@ -86,14 +109,14 @@ def _init_worker(counts):
 
 
 def _run_single_trial(args):
-    seed, k, eps, method_name = args
+    seed, k, rho, method_name = args
     set_seeds(seed)
     counts = _worker_state["counts"]
 
     runner = RUNNERS[method_name]
 
     start = time.perf_counter()
-    predicted = runner(counts, k, eps)
+    predicted = runner(counts, k, rho)
     elapsed = time.perf_counter() - start
 
     true_topk = np.sort(counts)[::-1][:k]
@@ -107,7 +130,7 @@ def _run_single_trial(args):
 if __name__ == "__main__":
     set_seeds(42)
     n_trials = 50
-    eps_values = [1.0]
+    rho_values = [1.0]
     k_values = np.arange(5, 205, 10)
     n_workers = 2
     datasets = [
@@ -116,9 +139,9 @@ if __name__ == "__main__":
         ("movies", "count"),
     ]
     method_names = [
-        # "joint",
-        "esnm_joint_t",
-        # "esnm_joint_lln",
+        "joint",
+        # "esnm_joint_t",
+        "esnm_joint_lln",
     ]
 
     results_dir = Path.cwd() / "results/topk"
@@ -137,26 +160,26 @@ if __name__ == "__main__":
             result_file = results_dir / f"{ds_name}_{method_name}.txt"
 
             seed_rng = np.random.RandomState(42)
-            total_trials = len(k_values) * len(eps_values) * n_trials
+            total_trials = len(k_values) * len(rho_values) * n_trials
             all_seeds = seed_rng.randint(0, 2**31 - 1, size=total_trials)
             seed_idx = 0
 
             try:
                 with open(result_file, "w+") as f:
                     print(
-                        "method\tk\teps\tmean_l1\tmedian_l1\tp25_l1\tp75_l1\tmean_linf\tmedian_linf\tp25_linf\tp75_linf\tmean_ndcg\tmedian_ndcg\tp25_ndcg\tp75_ndcg\tmean_time\tmedian_time\tp25_time\tp75_time",
+                        "method\tk\trho\tmean_l1\tmedian_l1\tp25_l1\tp75_l1\tmean_linf\tmedian_linf\tp25_linf\tp75_linf\tmean_ndcg\tmedian_ndcg\tp25_ndcg\tp75_ndcg\tmean_time\tmedian_time\tp25_time\tp75_time",
                         file=f,
                     )
 
                     for k in k_values:
-                        for e in eps_values:
+                        for rho in rho_values:
                             trial_args = []
                             for run in range(n_trials):
                                 trial_args.append(
                                     (
                                         int(all_seeds[seed_idx]),
                                         int(k),
-                                        e,
+                                        rho,
                                         method_name,
                                     )
                                 )
@@ -187,11 +210,11 @@ if __name__ == "__main__":
                             p75_time = np.percentile(time_elapsed_arr, 75)
 
                             print(
-                                f"{method_name}\t{k}\t{e:.4f}\t{mean_l1:.6f}\t{median_l1:.6f}\t{p25_l1:.6f}\t{p75_l1:.6f}\t{mean_linf:.6f}\t{median_linf:.6f}\t{p25_linf:.6f}\t{p75_linf:.6f}\t{mean_ndcg:.6f}\t{median_ndcg:.6f}\t{p25_ndcg:.6f}\t{p75_ndcg:.6f}\t{mean_time:.4f}\t{median_time:.4f}\t{p25_time:.4f}\t{p75_time:.4f}",
+                                f"{method_name}\t{k}\t{rho:.4f}\t{mean_l1:.6f}\t{median_l1:.6f}\t{p25_l1:.6f}\t{p75_l1:.6f}\t{mean_linf:.6f}\t{median_linf:.6f}\t{p25_linf:.6f}\t{p75_linf:.6f}\t{mean_ndcg:.6f}\t{median_ndcg:.6f}\t{p25_ndcg:.6f}\t{p75_ndcg:.6f}\t{mean_time:.4f}\t{median_time:.4f}\t{p25_time:.4f}\t{p75_time:.4f}",
                                 file=f,
                             )
                             print(
-                                f"{method_name}\t{k}\t{e:.4f}\t{mean_l1:.6f}\t{median_l1:.6f}\t{p25_l1:.6f}\t{p75_l1:.6f}\t{mean_linf:.6f}\t{median_linf:.6f}\t{p25_linf:.6f}\t{p75_linf:.6f}\t{mean_ndcg:.6f}\t{median_ndcg:.6f}\t{p25_ndcg:.6f}\t{p75_ndcg:.6f}\t{mean_time:.4f}\t{median_time:.4f}\t{p25_time:.4f}\t{p75_time:.4f}"
+                                f"{method_name}\t{k}\t{rho:.4f}\t{mean_l1:.6f}\t{median_l1:.6f}\t{p25_l1:.6f}\t{p75_l1:.6f}\t{mean_linf:.6f}\t{median_linf:.6f}\t{p25_linf:.6f}\t{p75_linf:.6f}\t{mean_ndcg:.6f}\t{median_ndcg:.6f}\t{p25_ndcg:.6f}\t{p75_ndcg:.6f}\t{mean_time:.4f}\t{median_time:.4f}\t{p25_time:.4f}\t{p75_time:.4f}"
                             )
 
                 pool.close()

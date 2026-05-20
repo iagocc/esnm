@@ -11,13 +11,14 @@ row reports the analytical mean-absolute-value error and the analytical
 expected rank error at a given **rho-zCDP** budget (the `eps` column is
 the rho axis, kept under that name for backward compatibility).
 
-Budget alignment across methods:
-  * eSNM (lln, tdist): the optimizer receives the loop value directly;
-    the argmax-based privacy proof treats it as rho already.
-  * Pure-DP methods (ld, shifted_ld, si): the loop value is converted to
-    pure-DP epsilon via `src/dp_conv.py::rho_zcdp_to_eps_for_pure_dp`
-    (epsilon = sqrt(2 * rho)), so the mechanism is rho-zCDP by Lemma 9
-    of Bun & Steinke (pure-eps-DP implies (1/2)*eps^2-CDP).
+Budget alignment across methods. The loop value (rho) is converted to a per-call
+epsilon = sqrt(2 * rho) for every method, so each one-shot call is rho-zCDP
+(rho = eps^2 / 2):
+  * tdist, ld, shifted_ld, si: pure-eps-DP mechanisms (Student's-T is pure-DP by
+    Bun & Steinke 2019, Thm 31), rho-zCDP via eps-DP => (1/2 eps^2)-zCDP
+    (`rho_zcdp_to_eps_for_pure_dp`).
+  * lln: Laplace-log-normal noise is NOT pure-DP; it is directly (1/2 eps^2)-CDP
+    (Prop. 3), which equals rho-zCDP at the same epsilon (`rho_zcdp_to_cdp_eps`).
 
 The module is organised as five layers:
 
@@ -37,7 +38,7 @@ import numpy as np
 from esnm.mechanism import esnm_lln_pmf, esnm_t_pmf
 from esnm.percentile import get_ls
 
-from src.dp_conv import rho_zcdp_to_eps_for_pure_dp
+from src.dp_conv import rho_zcdp_to_cdp_eps, rho_zcdp_to_eps_for_pure_dp
 from src.local_dampening import ld_pmf, shifted_ld_pmf
 from src.optimize_params import (
     Array1DFloat,
@@ -340,7 +341,11 @@ def _esnm_pmf(m_name: str, u: np.ndarray, params: Params) -> np.ndarray:
 def run_esnm(
     m_name: str, setup: Setup, eps: float, **_: object
 ) -> dict[str, float]:
-    params = _esnm_params(m_name, setup, eps)
+    # tdist (Student's-T) is pure eps-DP (Thm 31); lln is (1/2 eps^2)-CDP (Prop 3).
+    # Both reach rho-zCDP at the same eps = sqrt(2*rho), via different proofs.
+    convert = rho_zcdp_to_eps_for_pure_dp if m_name == "tdist" else rho_zcdp_to_cdp_eps
+    cdp_eps = convert(eps)
+    params = _esnm_params(m_name, setup, cdp_eps)
     probs = _normalize_probs(_esnm_pmf(m_name, setup.u, params))
     return metrics_from_pmf(probs, setup.gm)
 
@@ -482,9 +487,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=(
             "Compare DP percentile-selection mechanisms over a rho-zCDP "
             "budget sweep (the `eps` column / flag is the rho axis). "
-            "Pure-DP methods (ld, shifted_ld, si) receive sqrt(2*rho) via "
-            "rho_zcdp_to_eps_for_pure_dp; eSNM optimizers take rho "
-            "unchanged (argmax-based proof). "
+            "Every method receives epsilon = sqrt(2*rho) so each call is "
+            "rho-zCDP: pure-DP methods (tdist, ld, shifted_ld, si) via "
+            "rho_zcdp_to_eps_for_pure_dp, and lln (which is (1/2 eps^2)-CDP, "
+            "not pure-DP) via rho_zcdp_to_cdp_eps. "
             f"One TSV per (dataset, method, percentile) under {_RESULTS_DIR}/."
         )
     )
