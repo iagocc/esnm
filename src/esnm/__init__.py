@@ -2,6 +2,8 @@ from .dist_lln import get_s_and_sigma, lln_cdf, lln_pdf
 from .mechanism import (
     esnm_gcp,
     esnm_gcp_pmf,
+    esnm_lcp,
+    esnm_lcp_pmf,
     esnm_lln,
     esnm_lln_pmf,
     esnm_t,

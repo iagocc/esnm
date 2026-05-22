@@ -1,7 +1,8 @@
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
-#include <ctime>
 #include <limits>
 #include <numeric>
 #include <vector>
@@ -14,6 +15,7 @@
 #include <omp.h>
 
 #include "distributions/gcp.h"
+#include "distributions/lcp.h"
 #include "distributions/lln.h"
 #include "distributions/prng.h"
 
@@ -70,6 +72,12 @@ struct GCPDistribution {
     double survival(double x, double /*sigma*/) const { return gcp_survival(x, 1.0, gamma); }
 };
 
+struct LCPDistribution {
+    double gamma;
+    double pdf(double x, double /*sigma*/) const { return lcp_pdf(x, 1.0, gamma); }
+    double survival(double x, double /*sigma*/) const { return lcp_survival(x, 1.0, gamma); }
+};
+
 struct LLNDistribution {
     static double pdf(double x, double sigma)      { return lln_pdf(x, sigma); }
     static double survival(double x, double sigma) { return 1.0 - lln_cdf(x, sigma); }
@@ -114,6 +122,27 @@ inline double sample_gcp_noise(gsl_rng* r, double gamma) {
     return (gsl_rng_uniform(r) < 0.5) ? -m : m;
 }
 
+// LCP mixture sampler with sigma = 1. The body is a truncated standard
+// Laplace draw; tail magnitudes are Pareto with a uniform random sign.
+inline double sample_lcp_noise(gsl_rng* r, double gamma) {
+    const double g1       = gamma + 1.0;
+    const double z0       = g1;
+    const double exp_term = std::exp(-g1);
+    const double p_core   = (1.0 - exp_term) / lcp_detail::kappa(gamma);
+
+    if (gsl_rng_uniform(r) < p_core) {
+        double x;
+        do {
+            x = gsl_ran_laplace(r, 1.0);
+        } while (std::fabs(x) > z0);
+        return x;
+    }
+
+    const double u = gsl_rng_uniform(r);
+    const double m = z0 * std::pow(u, -1.0 / gamma);
+    return (gsl_rng_uniform(r) < 0.5) ? -m : m;
+}
+
 // ---------------------------------------------------------------------------
 // Argmax sampler
 // ---------------------------------------------------------------------------
@@ -136,12 +165,24 @@ size_t esnm_sample_argmax(
     size_t selected_idx     = 0;
     double selected_utility = -std::numeric_limits<double>::infinity();
 
+    // Global call counter: guarantees distinct seeds even for calls that land
+    // in the same clock tick (std::time has 1 s resolution, so a tight loop of
+    // calls would otherwise reuse one seed and return identical draws). The
+    // high-resolution clock and thread id add entropy across runs and threads.
+    static std::atomic<unsigned long long> seed_counter{0};
+
     #pragma omp parallel
     {
         gsl_rng* r = gsl_rng_alloc(gsl_rng_xoshiro256plusplus);
-        const unsigned long seed =
-            static_cast<unsigned long>(std::time(nullptr))
-            ^ (static_cast<unsigned long>(omp_get_thread_num()) * 1099511628211ULL);
+        const unsigned long long now = static_cast<unsigned long long>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        const unsigned long long counter =
+            seed_counter.fetch_add(1, std::memory_order_relaxed);
+        const unsigned long seed = static_cast<unsigned long>(
+            (now * 0x9E3779B97F4A7C15ULL)
+            ^ (counter * 0xD1B54A32D192ED03ULL)
+            ^ (static_cast<unsigned long long>(omp_get_thread_num())
+               * 1099511628211ULL));
         gsl_rng_set(r, seed);
 
         double local_best_utility = -std::numeric_limits<double>::infinity();
@@ -202,7 +243,10 @@ double generic_integrand(double x, void* params, const Distribution& dist) {
     const double scale         = sensitivity / p.s_values->at(r);
     const double sigma         = p.sigmas ? p.sigmas->at(r) : 0.0;
     const double y             = dist.pdf(x, sigma);
-    const double scaled_diff   = (p.u_r_star - p.u->at(r) + x) / scale;
+    // x is the base-unit noise on r; only the utility gap is divided by scale.
+    // (Dividing x by scale too would understate the noise and over-sharpen the
+    // pmf.)  P(r beats r_star | noise x) = P(Z_r* < x + gap/scale).
+    const double scaled_diff   = (p.u_r_star - p.u->at(r)) / scale + x;
     const double survival      = dist.survival(scaled_diff, sigma);
     return y * survival;
 }
@@ -216,6 +260,12 @@ double gcp_integrand(double x, void* params) {
     // The `df` field carries gamma for GCP (no struct churn).
     const integrand_params& p = *static_cast<integrand_params*>(params);
     GCPDistribution dist{p.df};
+    return generic_integrand(x, params, dist);
+}
+double lcp_integrand(double x, void* params) {
+    // The `df` field carries gamma for LCP (no struct churn).
+    const integrand_params& p = *static_cast<integrand_params*>(params);
+    LCPDistribution dist{p.df};
     return generic_integrand(x, params, dist);
 }
 double lln_integrand(double x, void* params) {
@@ -364,6 +414,17 @@ Probs esnm_gcp_pmf(
                        &gcp_integrand, "GCP", R);
 }
 
+Probs esnm_lcp_pmf(
+    const Utilities&           u,
+    const std::vector<double>& smooth_s,
+    const std::vector<double>& s_values,
+    double                     gamma,
+    const std::vector<size_t>* R = nullptr
+) {
+    return compute_pmf(u, smooth_s, s_values, nullptr, /*df=*/gamma,
+                       &lcp_integrand, "LCP", R);
+}
+
 Probs esnm_lln_pmf(
     const Utilities&           u,
     const std::vector<double>& smooth_s,
@@ -411,6 +472,18 @@ size_t esnm_gcp(
                               });
 }
 
+size_t esnm_lcp(
+    const Utilities&           u,
+    const std::vector<double>& smooth_s,
+    const std::vector<double>& s_values,
+    double                     gamma
+) {
+    return esnm_sample_argmax(u, smooth_s, s_values,
+                              [gamma](gsl_rng* r, size_t /*i*/) {
+                                  return sample_lcp_noise(r, gamma);
+                              });
+}
+
 NB_MODULE(mechanism, m) {
     // Disable GSL's default abort-on-error handler. Without this, transient
     // integration roundoff in compute_pmf (e.g. on very concentrated noise
@@ -436,7 +509,13 @@ NB_MODULE(mechanism, m) {
              const std::vector<double>& s_values, double gamma) -> Probs {
               return esnm_gcp_pmf(u, smooth_s, s_values, gamma, nullptr);
           });
+    m.def("esnm_lcp_pmf",
+          [](const Utilities& u, const std::vector<double>& smooth_s,
+             const std::vector<double>& s_values, double gamma) -> Probs {
+              return esnm_lcp_pmf(u, smooth_s, s_values, gamma, nullptr);
+          });
     m.def("esnm_lln", &esnm_lln);
     m.def("esnm_t",   &esnm_t);
     m.def("esnm_gcp", &esnm_gcp);
+    m.def("esnm_lcp", &esnm_lcp);
 }

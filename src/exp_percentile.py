@@ -3,7 +3,7 @@
 Three utility specifications and several mechanism methods can be combined:
 
   --utility {smooth_value, rank, paper}
-  --methods {tdist, gcp, ld, shifted_ld, si}   (comma-separated)
+  --methods {tdist, gcp, lcp, ld, shifted_ld, si}   (comma-separated)
 
 For every (dataset, percentile, mechanism) combination the script writes a
 single TSV with one row per budget point to `results/percentile/`. Each row
@@ -27,7 +27,7 @@ import time
 from typing import Callable, NamedTuple
 
 import numpy as np
-from esnm.mechanism import esnm_gcp_pmf, esnm_t_pmf
+from esnm.mechanism import esnm_gcp_pmf, esnm_lcp_pmf, esnm_t_pmf
 from esnm.percentile import get_ls
 
 from src.local_dampening import ld_pmf, shifted_ld_pmf
@@ -35,6 +35,7 @@ from src.optimize_params import (
     Array1DFloat,
     Array2DFloat,
     optimize_params_gcp,
+    optimize_params_lcp,
     optimize_params_tdist,
 )
 from src.shifted_inverse import (
@@ -50,13 +51,15 @@ from src.shifted_inverse import (
 # ---------------------------------------------------------------------------
 
 _VALID_UTILITIES = ("smooth_value", "rank", "paper")
-_VALID_METHODS = ("tdist", "gcp", "ld", "shifted_ld", "si")
+_VALID_METHODS = ("tdist", "gcp", "lcp", "ld", "shifted_ld", "si")
 _RESULTS_DIR = "results/percentile"
 _LS_CACHE_DIR = "states"
 _EPS_RANGE = (0.1, 10.0)
 _COLUMNS = ("p", "eps", "mae", "rank_err", "time")
 # Tail exponent for the Gaussian-core Pareto-tail (GCP) noise (gamma > 2).
 _GCP_GAMMA = 3.5
+# Tail exponent for the Laplace-core Pareto-tail (LCP) noise (gamma > 2).
+_LCP_GAMMA = 4
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +83,13 @@ def get_params_gcp(eps: float, ls: Array2DFloat) -> Params:
     # GCP feasibility: t < eps / gamma (sigma fixed to 1, WLOG).
     t_candidates = np.linspace(0, eps / _GCP_GAMMA, 150)
     t, s, _, ss = optimize_params_gcp(eps, _GCP_GAMMA, t_candidates, ls)
+    return Params(t, s, ss)
+
+
+def get_params_lcp(eps: float, ls: Array2DFloat) -> Params:
+    # LCP feasibility: t < eps / gamma (sigma fixed to 1, WLOG).
+    t_candidates = np.linspace(0, eps / _LCP_GAMMA, 150)
+    t, s, _, ss = optimize_params_lcp(eps, _LCP_GAMMA, t_candidates, ls)
     return Params(t, s, ss)
 
 
@@ -311,6 +321,7 @@ def _esnm_params(m_name: str, setup: Setup, eps: float) -> Params:
     optimizer = {
         "tdist": get_params_tdist,
         "gcp": get_params_gcp,
+        "lcp": get_params_lcp,
     }[m_name]
     if setup.ls.ndim == 1:
         scalar = optimizer(eps, setup.ls.reshape(1, -1))
@@ -321,7 +332,9 @@ def _esnm_params(m_name: str, setup: Setup, eps: float) -> Params:
 def _esnm_pmf(m_name: str, u: np.ndarray, params: Params) -> np.ndarray:
     if m_name == "tdist":
         return esnm_t_pmf(u, params.ss, params.s, 3.0)
-    return esnm_gcp_pmf(u, params.ss, params.s, _GCP_GAMMA)
+    if m_name == "gcp":
+        return esnm_gcp_pmf(u, params.ss, params.s, _GCP_GAMMA)
+    return esnm_lcp_pmf(u, params.ss, params.s, _LCP_GAMMA)
 
 
 def run_esnm(m_name: str, setup: Setup, eps: float, **_: object) -> dict[str, float]:
@@ -367,6 +380,7 @@ def run_si(
 _RUNNERS: dict[str, Callable[..., dict[str, float]]] = {
     "tdist": run_esnm,
     "gcp": run_esnm,
+    "lcp": run_esnm,
     "ld": run_ld,
     "shifted_ld": run_ld,
     "si": run_si,
@@ -475,7 +489,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         type=_csv_methods,
-        default="tdist,gcp",
+        default="tdist,gcp,lcp",
         help=(
             "Comma-separated mechanism methods from "
             f"{list(_VALID_METHODS)} (default: %(default)s)."
