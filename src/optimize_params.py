@@ -1,3 +1,4 @@
+import math
 from typing import Callable, Union
 
 import numpy as np
@@ -213,6 +214,225 @@ def optimize_params_tdist(
         if R is None:
             raise ValueError("R must be provided when local_sensitivity is a function.")
         return _optimize_params_tdist_func(eps, d, t_candidates, local_sensitivity, R)
+    else:
+        raise TypeError(
+            f"local_sensitivity must be a numpy array or callable, got {type(local_sensitivity)}"
+        )
+
+
+# =============================================================================
+# Gaussian-core Pareto-tail (GCP) Distribution Optimization
+# =============================================================================
+# From Corollary cor:gcp-adm (with sigma fixed to 1, WLOG):
+#   Privacy: ε = √(γ+1)·s + γ·t
+#   Optimal s = (ε - γ·t)/√(γ+1)
+#   Variance of GCP(1,γ) = V(γ) = M₂(γ)/κ(γ) for γ > 2
+#   Noise variance = ss² · V(γ)·(γ+1) / (ε - γ·t)²
+# =============================================================================
+
+
+def gcp_variance_coeff(gamma: float) -> float:
+    """Variance constant V(γ) = M₂(γ)/κ(γ) of GCP(σ=1, γ).
+
+    Requires γ > 2 for finite variance. Φ is the standard normal CDF.
+    Computed once, in pure Python (outside numba).
+    """
+    g1 = gamma + 1.0
+    sg1 = math.sqrt(g1)
+    phi_sg1 = 0.5 * (1.0 + math.erf(sg1 / math.sqrt(2.0)))
+    exp_term = math.exp(-0.5 * g1)
+
+    kappa = math.sqrt(2.0 * math.pi) * (2.0 * phi_sg1 - 1.0) + (2.0 / gamma) * sg1 * exp_term
+    m2 = (
+        math.sqrt(2.0 * math.pi) * (2.0 * phi_sg1 - 1.0)
+        - 2.0 * sg1 * exp_term
+        + (2.0 / (gamma - 2.0)) * g1**1.5 * exp_term
+    )
+    return m2 / kappa
+
+
+@njit(cache=True)
+def optimal_s_gcp(eps: float, gamma: float, t: float) -> float:
+    """Compute optimal scale parameter s for GCP.
+
+    s = (ε - γ·t)/√(γ+1), or 0 if infeasible.
+    """
+    if t >= eps / gamma:
+        return 0.0
+    return (eps - gamma * t) / np.sqrt(gamma + 1.0)
+
+
+@njit(cache=True, parallel=True)
+def _optimize_params_gcp_array(
+    eps: float,
+    gamma: float,
+    V: float,
+    t_candidates: Array1DFloat,
+    local_sensitivity: Array2DFloat,
+) -> tuple[Array1DFloat, Array1DFloat, Array1DFloat, Array1DFloat]:
+    """Optimize GCP parameters using array-based local sensitivity.
+
+    Finds optimal (t, s) that minimize variance for each element r.
+    Variance formula: ss² · V·(γ+1) / (ε - γ·t)²
+
+    Performance characteristics mirror _optimize_params_tdist_array:
+    a serial pre-pass computes per-t scalars (B, s) and decay vectors once,
+    then a prange(R) main pass minimises variance per element.
+    """
+    R, K = local_sensitivity.shape
+    T    = t_candidates.size
+
+    best_var = np.full(R, 1e308)
+    best_t   = np.zeros(R)
+    best_s   = np.zeros(R)
+    best_ss  = np.zeros(R)
+
+    eps_div = eps / gamma
+    sqrt_g1 = np.sqrt(gamma + 1.0)
+
+    # ------------------------------------------------------------------
+    # Serial pre-pass: for each valid t candidate, compute the variance
+    # coefficient B, the optimal s, and the length-K decay vector.
+    # ------------------------------------------------------------------
+    pre_t     = np.empty(T)
+    pre_B     = np.empty(T)
+    pre_s     = np.empty(T)
+    pre_decay = np.empty((T, K))
+    n_valid   = 0
+
+    for ti in range(T):
+        t = t_candidates[ti]
+        if t < 0.0 or t >= eps_div:
+            continue
+
+        denom = eps - gamma * t
+        s     = denom / sqrt_g1
+        if s <= 0.0:
+            continue
+
+        pre_t[n_valid] = t
+        pre_B[n_valid] = V * (gamma + 1.0) / (denom * denom)
+        pre_s[n_valid] = s
+
+        # Incremental: exp(-t·k) = exp(-t)^k via one exp + k multiplies.
+        exp_neg_t = np.exp(-t)
+        decay     = 1.0
+        for k in range(K):
+            pre_decay[n_valid, k] = decay
+            decay *= exp_neg_t
+
+        n_valid += 1
+
+    # ------------------------------------------------------------------
+    # Parallel main pass: each element r independently finds the t that
+    # minimises its variance. No shared writes — r indexes are disjoint.
+    # ------------------------------------------------------------------
+    for r in prange(R):
+        for vi in range(n_valid):
+            # Smooth sensitivity: max_k( LS[r,k] · e^{-t·k} )
+            mx = 0.0
+            for k in range(K):
+                v = local_sensitivity[r, k] * pre_decay[vi, k]
+                if v > mx:
+                    mx = v
+
+            var_r = pre_B[vi] * mx * mx
+            if var_r < best_var[r]:
+                best_var[r] = var_r
+                best_t[r]   = pre_t[vi]
+                best_s[r]   = pre_s[vi]
+                best_ss[r]  = mx
+
+    return best_t, best_s, best_var, best_ss
+
+
+def _optimize_params_gcp_func(
+    eps: float,
+    gamma: float,
+    V: float,
+    t_candidates: Array1DFloat,
+    smooth_sensitivity_func: SmoothSensitivityFunc,
+    R: int,
+) -> tuple[Array1DFloat, Array1DFloat, Array1DFloat, Array1DFloat]:
+    """Optimize GCP parameters using function-based smooth sensitivity."""
+    best_var = np.full(R, 1e308)
+    best_t = np.zeros(R)
+    best_s = np.zeros(R)
+    best_ss = np.zeros(R)
+
+    eps_div = eps / gamma
+    sqrt_g1 = np.sqrt(gamma + 1.0)
+
+    for ti in range(t_candidates.size):
+        t = t_candidates[ti]
+
+        if t < 0.0 or t >= eps_div:
+            continue
+
+        denom = eps - gamma * t
+        s = denom / sqrt_g1
+
+        if s <= 0.0:
+            continue
+
+        B = V * (gamma + 1.0) / (denom * denom)
+
+        for r in range(R):
+            ss = smooth_sensitivity_func(r, t)
+            var_r = B * ss * ss
+
+            if var_r < best_var[r]:
+                best_var[r] = var_r
+                best_t[r] = t
+                best_s[r] = s
+                best_ss[r] = ss
+
+    return best_t, best_s, best_var, best_ss
+
+
+def optimize_params_gcp(
+    eps: float,
+    gamma: float,
+    t_candidates: Array1DFloat,
+    local_sensitivity: LocalSensitivityType,
+    R: int | None = None,
+) -> tuple[Array1DFloat, Array1DFloat, Array1DFloat, Array1DFloat]:
+    """
+    Optimize parameters for GCP (Gaussian-core Pareto-tail) based mechanism.
+
+    Based on Corollary cor:gcp-adm. With sigma fixed to 1 (WLOG).
+
+    Parameters
+    ----------
+    eps : float
+        Privacy parameter epsilon.
+    gamma : float
+        Tail shape parameter (must be > 2 for finite variance).
+    t_candidates : Array1DFloat
+        Array of candidate t values to search over.
+    local_sensitivity : Array2DFloat | Callable[[int, float], float]
+        Either a 2D numpy array of shape (R, K) where local_sensitivity[r, k]
+        gives the sensitivity for element r at distance k, or a callable
+        function(r, t) -> float that returns the smooth sensitivity directly.
+    R : int | None
+        Number of elements. Required if local_sensitivity is a function.
+
+    Returns
+    -------
+    tuple[Array1DFloat, Array1DFloat, Array1DFloat, Array1DFloat]
+        (best_t, best_s, best_var, best_ss) arrays of length R.
+    """
+    if gamma <= 2.0:
+        raise ValueError(f"gamma must be > 2 for finite variance, got {gamma}")
+
+    V = gcp_variance_coeff(gamma)
+
+    if isinstance(local_sensitivity, np.ndarray):
+        return _optimize_params_gcp_array(eps, gamma, V, t_candidates, local_sensitivity)
+    elif callable(local_sensitivity):
+        if R is None:
+            raise ValueError("R must be provided when local_sensitivity is a function.")
+        return _optimize_params_gcp_func(eps, gamma, V, t_candidates, local_sensitivity, R)
     else:
         raise TypeError(
             f"local_sensitivity must be a numpy array or callable, got {type(local_sensitivity)}"

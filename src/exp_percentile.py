@@ -1,24 +1,16 @@
-"""Compare DP percentile-selection mechanisms over a privacy-budget sweep.
+"""Compare DP percentile-selection mechanisms over a pure eps-DP budget sweep.
 
-Three utility specifications and five mechanism methods can be combined:
+Three utility specifications and several mechanism methods can be combined:
 
   --utility {smooth_value, rank, paper}
-  --methods {lln, tdist, ld, shifted_ld, si}   (comma-separated)
+  --methods {tdist, gcp, ld, shifted_ld, si}   (comma-separated)
 
 For every (dataset, percentile, mechanism) combination the script writes a
-single TSV with one row per budget point to `results/percentile/`. Each
-row reports the analytical mean-absolute-value error and the analytical
-expected rank error at a given **rho-zCDP** budget (the `eps` column is
-the rho axis, kept under that name for backward compatibility).
-
-Budget alignment across methods. The loop value (rho) is converted to a per-call
-epsilon = sqrt(2 * rho) for every method, so each one-shot call is rho-zCDP
-(rho = eps^2 / 2):
-  * tdist, ld, shifted_ld, si: pure-eps-DP mechanisms (Student's-T is pure-DP by
-    Bun & Steinke 2019, Thm 31), rho-zCDP via eps-DP => (1/2 eps^2)-zCDP
-    (`rho_zcdp_to_eps_for_pure_dp`).
-  * lln: Laplace-log-normal noise is NOT pure-DP; it is directly (1/2 eps^2)-CDP
-    (Prop. 3), which equals rho-zCDP at the same epsilon (`rho_zcdp_to_cdp_eps`).
+single TSV with one row per budget point to `results/percentile/`. Each row
+reports the analytical mean-absolute-value error and the analytical expected
+rank error at a given pure (eps, 0)-DP budget (the `eps` column is the epsilon
+axis). Every mechanism receives the same epsilon directly -- there is no
+rho/zCDP conversion.
 
 The module is organised as five layers:
 
@@ -35,15 +27,14 @@ import time
 from typing import Callable, NamedTuple
 
 import numpy as np
-from esnm.mechanism import esnm_lln_pmf, esnm_t_pmf
+from esnm.mechanism import esnm_gcp_pmf, esnm_t_pmf
 from esnm.percentile import get_ls
 
-from src.dp_conv import rho_zcdp_to_cdp_eps, rho_zcdp_to_eps_for_pure_dp
 from src.local_dampening import ld_pmf, shifted_ld_pmf
 from src.optimize_params import (
     Array1DFloat,
     Array2DFloat,
-    optimize_params_lln,
+    optimize_params_gcp,
     optimize_params_tdist,
 )
 from src.shifted_inverse import (
@@ -54,17 +45,18 @@ from src.shifted_inverse import (
     sampler_components,
 )
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 _VALID_UTILITIES = ("smooth_value", "rank", "paper")
-_VALID_METHODS = ("lln", "tdist", "ld", "shifted_ld", "si")
+_VALID_METHODS = ("tdist", "gcp", "ld", "shifted_ld", "si")
 _RESULTS_DIR = "results/percentile"
 _LS_CACHE_DIR = "states"
 _EPS_RANGE = (0.1, 10.0)
 _COLUMNS = ("p", "eps", "mae", "rank_err", "time")
+# Tail exponent for the Gaussian-core Pareto-tail (GCP) noise (gamma > 2).
+_GCP_GAMMA = 3.5
 
 
 # ---------------------------------------------------------------------------
@@ -76,19 +68,19 @@ class Params(NamedTuple):
     t: Array1DFloat
     s: Array1DFloat | None
     ss: Array1DFloat
-    sigma: Array1DFloat | None
 
 
 def get_params_tdist(eps: float, ls: Array2DFloat, d: float = 3) -> Params:
     t_candidates = np.linspace(0, eps / (d + 1), 150)
     t, s, _, ss = optimize_params_tdist(eps, d, t_candidates, ls)
-    return Params(t, s, ss, None)
+    return Params(t, s, ss)
 
 
-def get_params_lln(eps: float, ls: Array2DFloat) -> Params:
-    t_candidates = np.logspace(-9, 10, 150)
-    t, sigmas, s, _, ss = optimize_params_lln(eps, t_candidates, ls)
-    return Params(t, s, ss, sigmas)
+def get_params_gcp(eps: float, ls: Array2DFloat) -> Params:
+    # GCP feasibility: t < eps / gamma (sigma fixed to 1, WLOG).
+    t_candidates = np.linspace(0, eps / _GCP_GAMMA, 150)
+    t, s, _, ss = optimize_params_gcp(eps, _GCP_GAMMA, t_candidates, ls)
+    return Params(t, s, ss)
 
 
 def broadcast_params(params: Params, size: int) -> Params:
@@ -101,7 +93,6 @@ def broadcast_params(params: Params, size: int) -> Params:
         np.full(size, float(params.t[0]), dtype=np.float64),
         _fill(params.s),
         np.full(size, float(params.ss[0]), dtype=np.float64),
-        _fill(params.sigma),
     )
 
 
@@ -181,9 +172,7 @@ def quantile_gap_local_sensitivity(
         t = np.arange(d + 2)
         hi_idx = np.clip(m + t, 0, n + 1)
         lo_idx = np.clip(m + t - d - 1, 0, n + 1)
-        ls[d] = min(
-            global_sensitivity, float(np.max(ext[hi_idx] - ext[lo_idx]))
-        )
+        ls[d] = min(global_sensitivity, float(np.max(ext[hi_idx] - ext[lo_idx])))
     return ls
 
 
@@ -210,9 +199,7 @@ def load_or_build_ls(
 # ---------------------------------------------------------------------------
 
 
-def grid_rank_err(
-    x_sorted: np.ndarray, k_p: int, grid: np.ndarray
-) -> np.ndarray:
+def grid_rank_err(x_sorted: np.ndarray, k_p: int, grid: np.ndarray) -> np.ndarray:
     """Rank distance per grid point under bisect-left + clip projection.
 
     Matches the convention used by SI's `expected_rank_error` so all
@@ -240,9 +227,7 @@ def index_metrics(x_sorted: np.ndarray, k_p: int) -> dict[str, np.ndarray]:
     }
 
 
-def metrics_from_pmf(
-    probs: np.ndarray, gm: dict[str, np.ndarray]
-) -> dict[str, float]:
+def metrics_from_pmf(probs: np.ndarray, gm: dict[str, np.ndarray]) -> dict[str, float]:
     return {
         "mae": float(np.sum(probs * gm["val_abs"])),
         "rank_err": float(np.sum(probs * gm["rank_err"])),
@@ -298,9 +283,7 @@ def build_setup(
             if cap_lambda_override is not None
             else float(x_sorted[-1])
         )
-        cache_path = (
-            f"{_LS_CACHE_DIR}/ls_perc_{ds}_{int(p * 100)}.npz"
-        )
+        cache_path = f"{_LS_CACHE_DIR}/ls_perc_{ds}_{int(p * 100)}.npz"
         return Setup(
             u=utility_paper(x_sorted, k),
             ls=load_or_build_ls(cache_path, x_sorted, p, cap),
@@ -325,7 +308,10 @@ def _normalize_probs(probs: np.ndarray) -> np.ndarray:
 
 
 def _esnm_params(m_name: str, setup: Setup, eps: float) -> Params:
-    optimizer = {"lln": get_params_lln, "tdist": get_params_tdist}[m_name]
+    optimizer = {
+        "tdist": get_params_tdist,
+        "gcp": get_params_gcp,
+    }[m_name]
     if setup.ls.ndim == 1:
         scalar = optimizer(eps, setup.ls.reshape(1, -1))
         return broadcast_params(scalar, setup.m_size)
@@ -335,17 +321,12 @@ def _esnm_params(m_name: str, setup: Setup, eps: float) -> Params:
 def _esnm_pmf(m_name: str, u: np.ndarray, params: Params) -> np.ndarray:
     if m_name == "tdist":
         return esnm_t_pmf(u, params.ss, params.s, 3.0)
-    return esnm_lln_pmf(u, params.ss, params.s, params.sigma)
+    return esnm_gcp_pmf(u, params.ss, params.s, _GCP_GAMMA)
 
 
-def run_esnm(
-    m_name: str, setup: Setup, eps: float, **_: object
-) -> dict[str, float]:
-    # tdist (Student's-T) is pure eps-DP (Thm 31); lln is (1/2 eps^2)-CDP (Prop 3).
-    # Both reach rho-zCDP at the same eps = sqrt(2*rho), via different proofs.
-    convert = rho_zcdp_to_eps_for_pure_dp if m_name == "tdist" else rho_zcdp_to_cdp_eps
-    cdp_eps = convert(eps)
-    params = _esnm_params(m_name, setup, cdp_eps)
+def run_esnm(m_name: str, setup: Setup, eps: float, **_: object) -> dict[str, float]:
+    # Pure (eps, 0)-DP: epsilon is used directly, with no rho/zCDP conversion.
+    params = _esnm_params(m_name, setup, eps)
     probs = _normalize_probs(_esnm_pmf(m_name, setup.u, params))
     return metrics_from_pmf(probs, setup.gm)
 
@@ -365,14 +346,9 @@ def _ld_ls_for(setup: Setup) -> np.ndarray:
     return setup.ls
 
 
-def run_ld(
-    m_name: str, setup: Setup, eps: float, **_: object
-) -> dict[str, float]:
+def run_ld(m_name: str, setup: Setup, eps: float, **_: object) -> dict[str, float]:
     pmf = {"ld": ld_pmf, "shifted_ld": shifted_ld_pmf}[m_name]
-    pure_eps = rho_zcdp_to_eps_for_pure_dp(eps)
-    probs = _normalize_probs(
-        pmf(setup.u, setup.gs, pure_eps, _ld_ls_for(setup))
-    )
+    probs = _normalize_probs(pmf(setup.u, setup.gs, eps, _ld_ls_for(setup)))
     return metrics_from_pmf(probs, setup.gm)
 
 
@@ -385,12 +361,12 @@ def run_si(
     k: int,
     **_: object,
 ) -> dict[str, float]:
-    return _si_metrics(x, k, rho_zcdp_to_eps_for_pure_dp(eps))
+    return _si_metrics(x, k, eps)
 
 
 _RUNNERS: dict[str, Callable[..., dict[str, float]]] = {
-    "lln": run_esnm,
     "tdist": run_esnm,
+    "gcp": run_esnm,
     "ld": run_ld,
     "shifted_ld": run_ld,
     "si": run_si,
@@ -402,9 +378,7 @@ _RUNNERS: dict[str, Callable[..., dict[str, float]]] = {
 # ---------------------------------------------------------------------------
 
 
-def _si_metrics(
-    x_sorted: np.ndarray, k: int, eps: float
-) -> dict[str, float]:
+def _si_metrics(x_sorted: np.ndarray, k: int, eps: float) -> dict[str, float]:
     """Analytical SI metrics at this (dataset, percentile-index k, eps)."""
     n = x_sorted.shape[0]
     min_value = float(x_sorted[0])
@@ -426,9 +400,7 @@ def _si_metrics(
 
     return {
         "mae": float(
-            expected_absolute_error(
-                components, tau, error_level, query_result
-            )
+            expected_absolute_error(components, tau, error_level, query_result)
         ),
         "rank_err": float(
             expected_rank_error(
@@ -475,9 +447,7 @@ def _csv_percentiles(raw: str) -> list[float]:
                 f"percentile {tok!r} is not an integer"
             ) from e
         if not 1 <= iv <= 99:
-            raise argparse.ArgumentTypeError(
-                f"percentile {iv} out of range [1, 99]"
-            )
+            raise argparse.ArgumentTypeError(f"percentile {iv} out of range [1, 99]")
         out.append(iv / 100.0)
     return out
 
@@ -485,12 +455,10 @@ def _csv_percentiles(raw: str) -> list[float]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare DP percentile-selection mechanisms over a rho-zCDP "
-            "budget sweep (the `eps` column / flag is the rho axis). "
-            "Every method receives epsilon = sqrt(2*rho) so each call is "
-            "rho-zCDP: pure-DP methods (tdist, ld, shifted_ld, si) via "
-            "rho_zcdp_to_eps_for_pure_dp, and lln (which is (1/2 eps^2)-CDP, "
-            "not pure-DP) via rho_zcdp_to_cdp_eps. "
+            "Compare DP percentile-selection mechanisms over a pure (eps, 0)-DP "
+            "budget sweep (the `eps` column / flag is the epsilon axis). "
+            "Every method receives the same epsilon directly, with no rho/zCDP "
+            "conversion. "
             f"One TSV per (dataset, method, percentile) under {_RESULTS_DIR}/."
         )
     )
@@ -507,7 +475,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         type=_csv_methods,
-        default="lln,tdist",
+        default="tdist,gcp",
         help=(
             "Comma-separated mechanism methods from "
             f"{list(_VALID_METHODS)} (default: %(default)s)."
@@ -523,19 +491,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--percentiles",
         type=_csv_percentiles,
         default="25,50,75",
-        help=(
-            "Comma-separated integer percentiles in [1, 99] "
-            "(default: %(default)s)."
-        ),
+        help=("Comma-separated integer percentiles in [1, 99] (default: %(default)s)."),
     )
     parser.add_argument(
         "--eps-count",
         type=int,
         default=50,
-        help=(
-            f"Number of epsilons in linspace{_EPS_RANGE} "
-            "(default: %(default)s)."
-        ),
+        help=(f"Number of epsilons in linspace{_EPS_RANGE} (default: %(default)s)."),
     )
     parser.add_argument(
         "--cap-lambda",
@@ -597,8 +559,7 @@ def _run_one_file(
             m = runner(method, setup, eps, x=x, k=k, p=p, ds=ds)
             elapsed = time.perf_counter() - t0
             row = (
-                f"{p}\t{eps:.4f}\t"
-                f"{m['mae']:.12f}\t{m['rank_err']:.12f}\t{elapsed:.4f}"
+                f"{p}\t{eps:.4f}\t{m['mae']:.12f}\t{m['rank_err']:.12f}\t{elapsed:.4f}"
             )
             print(row, file=f)
             print(row)
@@ -611,10 +572,7 @@ def main(args: argparse.Namespace) -> None:
     for method in args.methods:
         for ds in args.datasets:
             x = _load_dataset(ds)
-            print(
-                f"=== {args.utility} / {method} / {ds} "
-                f"(n={x.shape[0]}) ==="
-            )
+            print(f"=== {args.utility} / {method} / {ds} (n={x.shape[0]}) ===")
             for p in args.percentiles:
                 _run_one_file(
                     method=method,

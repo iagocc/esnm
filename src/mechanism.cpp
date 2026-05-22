@@ -13,6 +13,7 @@
 #include <nanobind/stl/vector.h>
 #include <omp.h>
 
+#include "distributions/gcp.h"
 #include "distributions/lln.h"
 #include "distributions/prng.h"
 
@@ -63,6 +64,12 @@ struct TStudentDistribution {
     }
 };
 
+struct GCPDistribution {
+    double gamma;
+    double pdf(double x, double /*sigma*/) const { return gcp_pdf(x, 1.0, gamma); }
+    double survival(double x, double /*sigma*/) const { return gcp_survival(x, 1.0, gamma); }
+};
+
 struct LLNDistribution {
     static double pdf(double x, double sigma)      { return lln_pdf(x, sigma); }
     static double survival(double x, double sigma) { return 1.0 - lln_cdf(x, sigma); }
@@ -82,6 +89,29 @@ inline double sample_lln_noise(gsl_rng* r, double sigma) {
     const double x = gsl_ran_laplace(r, 1.0);
     const double y = gsl_ran_gaussian_ziggurat(r, 1.0);
     return x * std::exp(sigma * y);
+}
+
+// GCP mixture sampler with sigma = 1: with prob p_core draw a truncated
+// N(0,1) on [-z0, z0] by rejection, otherwise draw a Pareto tail magnitude
+// with a uniform random sign. p_core depends only on gamma.
+inline double sample_gcp_noise(gsl_rng* r, double gamma) {
+    const double g1  = gamma + 1.0;
+    const double z0  = std::sqrt(g1);
+    const double p_core =
+        std::sqrt(2.0 * M_PI) * (2.0 * gcp_detail::phi(z0) - 1.0)
+        / gcp_detail::kappa(gamma);
+
+    if (gsl_rng_uniform(r) < p_core) {
+        double g;
+        do {
+            g = gsl_ran_gaussian_ziggurat(r, 1.0);
+        } while (std::fabs(g) > z0);
+        return g;
+    }
+
+    const double u = gsl_rng_uniform(r);
+    const double m = z0 * std::pow(u, -1.0 / gamma);
+    return (gsl_rng_uniform(r) < 0.5) ? -m : m;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +210,12 @@ double generic_integrand(double x, void* params, const Distribution& dist) {
 double t_student_integrand(double x, void* params) {
     const integrand_params& p = *static_cast<integrand_params*>(params);
     TStudentDistribution dist{p.df};
+    return generic_integrand(x, params, dist);
+}
+double gcp_integrand(double x, void* params) {
+    // The `df` field carries gamma for GCP (no struct churn).
+    const integrand_params& p = *static_cast<integrand_params*>(params);
+    GCPDistribution dist{p.df};
     return generic_integrand(x, params, dist);
 }
 double lln_integrand(double x, void* params) {
@@ -317,6 +353,17 @@ Probs esnm_t_pmf(
                        &t_student_integrand, "T-Student", R, 0, 1e-12);
 }
 
+Probs esnm_gcp_pmf(
+    const Utilities&           u,
+    const std::vector<double>& smooth_s,
+    const std::vector<double>& s_values,
+    double                     gamma,
+    const std::vector<size_t>* R = nullptr
+) {
+    return compute_pmf(u, smooth_s, s_values, nullptr, /*df=*/gamma,
+                       &gcp_integrand, "GCP", R);
+}
+
 Probs esnm_lln_pmf(
     const Utilities&           u,
     const std::vector<double>& smooth_s,
@@ -352,6 +399,18 @@ size_t esnm_t(
                               });
 }
 
+size_t esnm_gcp(
+    const Utilities&           u,
+    const std::vector<double>& smooth_s,
+    const std::vector<double>& s_values,
+    double                     gamma
+) {
+    return esnm_sample_argmax(u, smooth_s, s_values,
+                              [gamma](gsl_rng* r, size_t /*i*/) {
+                                  return sample_gcp_noise(r, gamma);
+                              });
+}
+
 NB_MODULE(mechanism, m) {
     // Disable GSL's default abort-on-error handler. Without this, transient
     // integration roundoff in compute_pmf (e.g. on very concentrated noise
@@ -372,6 +431,12 @@ NB_MODULE(mechanism, m) {
              const std::vector<double>& sigmas) -> Probs {
               return esnm_lln_pmf(u, smooth_s, s_values, sigmas, nullptr);
           });
+    m.def("esnm_gcp_pmf",
+          [](const Utilities& u, const std::vector<double>& smooth_s,
+             const std::vector<double>& s_values, double gamma) -> Probs {
+              return esnm_gcp_pmf(u, smooth_s, s_values, gamma, nullptr);
+          });
     m.def("esnm_lln", &esnm_lln);
     m.def("esnm_t",   &esnm_t);
+    m.def("esnm_gcp", &esnm_gcp);
 }

@@ -26,7 +26,7 @@ import pandas as pd
 from sklearn.metrics import ndcg_score
 
 from dp_conv import rho_zcdp_to_cdp_eps, rho_zcdp_to_eps_for_pure_dp
-from topk.esnm_joint import esnm_joint_lln, esnm_joint_t
+from topk.esnm_joint import esnm_joint_gcp, esnm_joint_lln, esnm_joint_t
 from topk.joint import joint_mechanism
 
 
@@ -90,10 +90,18 @@ def run_esnm_joint_lln(counts, k, rho):
     return counts[selected]
 
 
+def run_esnm_joint_gcp(counts, k, rho):
+    # GCP is (1/2 eps^2)-CDP (not pure-DP); eps = sqrt(2*rho) => rho-zCDP.
+    eps = rho_zcdp_to_cdp_eps(rho)
+    selected = esnm_joint_gcp(counts, eps, k, gamma=5.0)
+    return counts[selected]
+
+
 RUNNERS = {
     "joint": run_joint,
     "esnm_joint_t": run_esnm_joint_t,
     "esnm_joint_lln": run_esnm_joint_lln,
+    "esnm_joint_gcp": run_esnm_joint_gcp,
 }
 
 
@@ -142,6 +150,7 @@ if __name__ == "__main__":
         "joint",
         # "esnm_joint_t",
         "esnm_joint_lln",
+        "esnm_joint_gcp",
     ]
 
     results_dir = Path.cwd() / "results/topk"

@@ -1,13 +1,21 @@
 import numpy as np
 
-from esnm.mechanism import esnm_lln as _esnm_lln_cpp, esnm_t as _esnm_t_cpp
+from esnm.mechanism import (
+    esnm_gcp as _esnm_gcp_cpp,
+    esnm_lln as _esnm_lln_cpp,
+    esnm_t as _esnm_t_cpp,
+)
 from topk.joint import (
     compute_log_diff_counts,
     get_diffs_to_positions,
     make_diff_matrix,
     sequence_from_diff,
 )
-from optimize_params import optimize_params_tdist, optimize_params_lln
+from optimize_params import (
+    optimize_params_gcp,
+    optimize_params_lln,
+    optimize_params_tdist,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +142,22 @@ def _run_esnm_joint(
             np.ascontiguousarray(best_s),
             np.ascontiguousarray(best_sigma),
         )
+    elif noise == "gcp":
+        # GCP: t < eps/gamma for positive s (Corollary cor:gcp-adm; sigma=1 WLOG).
+        # `degree_freedom` carries gamma here. Logspace grid per Bun & Steinke §7.1.
+        t_upper = epsilon / degree_freedom - 1e-9
+        t_candidates = np.logspace(-9, np.log10(max(t_upper, 1e-9)), 150)
+        best_t, best_s, _, best_ss = optimize_params_gcp(
+            epsilon, degree_freedom, t_candidates, local_sensitivity
+        )
+        winner_local = _esnm_gcp_cpp(
+            np.ascontiguousarray(utility),
+            np.ascontiguousarray(best_ss * sensitivity),
+            np.ascontiguousarray(best_s),
+            degree_freedom,
+        )
     else:
-        raise ValueError("noise must be 't' or 'lln'.")
+        raise ValueError("noise must be 't', 'lln', or 'gcp'.")
 
     # 4. Reconstruct sequence from winner
     winner_idx = int(valid_idx[int(winner_local)])
@@ -178,3 +200,18 @@ def esnm_joint_lln(
     No tau needed.  Single noise draw per candidate (no MaxZ).
     """
     return _run_esnm_joint(counts, epsilon, k, "lln", sensitivity, 3.0)
+
+
+def esnm_joint_gcp(
+    counts: np.ndarray,
+    epsilon: float,
+    k: int,
+    sensitivity: int = 1,
+    gamma: float = 5.0,
+) -> np.ndarray:
+    """One-shot eSNM joint top-k with GCP (Gaussian-core Pareto-tail) noise.
+
+    Uses u(a) = -sqrt(1 + gap(a)) with naturally decaying smooth sensitivity.
+    `gamma` (> 2) is the tail exponent; sigma is fixed to 1 (WLOG). No tau needed.
+    """
+    return _run_esnm_joint(counts, epsilon, k, "gcp", sensitivity, gamma)
