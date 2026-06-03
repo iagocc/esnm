@@ -12,6 +12,12 @@ rank error at a given pure (eps, 0)-DP budget (the `eps` column is the epsilon
 axis). Every mechanism receives the same epsilon directly -- there is no
 rho/zCDP conversion.
 
+The eSNM mechanisms use a single FIXED, data-independent smoothing parameter
+`t` (the beta of the smooth-sensitivity framework), chosen as a balanced split
+of the feasibility cap -- exactly as in `src/topk/esnm_joint.py`. Only the
+scale `s` and the smooth sensitivity `ss` depend on the data (via the local
+sensitivity), so the pure-(eps, 0)-DP guarantee holds.
+
 The module is organised as five layers:
 
   1.  Utility / grid construction          (build_grid, utility_*, *_metrics)
@@ -56,10 +62,12 @@ _RESULTS_DIR = "results/percentile"
 _LS_CACHE_DIR = "states"
 _EPS_RANGE = (0.1, 10.0)
 _COLUMNS = ("p", "eps", "mae", "rank_err", "time")
+# Degrees of freedom for the Student-t noise (df > 2); aligned with exp_topk.
+_TDIST_DF = 5.0
 # Tail exponent for the Gaussian-core Pareto-tail (GCP) noise (gamma > 2).
-_GCP_GAMMA = 3.5
+_GCP_GAMMA = 5.0
 # Tail exponent for the Laplace-core Pareto-tail (LCP) noise (gamma > 2).
-_LCP_GAMMA = 4
+_LCP_GAMMA = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -68,29 +76,33 @@ _LCP_GAMMA = 4
 
 
 class Params(NamedTuple):
-    t: Array1DFloat
     s: Array1DFloat | None
     ss: Array1DFloat
 
 
-def get_params_tdist(eps: float, ls: Array2DFloat, d: float = 3) -> Params:
-    t_candidates = np.linspace(0, eps / (d + 1), 150)
-    t, s, _, ss = optimize_params_tdist(eps, d, t_candidates, ls)
-    return Params(t, s, ss)
+def get_params_tdist(eps: float, ls: Array2DFloat, d: float = _TDIST_DF) -> Params:
+    # Pure-DP: t is FIXED and data-independent (balanced split = half the cap
+    # eps/(d+1)), matching topk/esnm_joint.py. Only s and ss (smooth
+    # sensitivity) depend on the data via the local sensitivity ls.
+    fixed_t = 0.5 * eps / (d + 1.0)
+    _, s, _, ss = optimize_params_tdist(eps, d, np.array([fixed_t]), ls)
+    return Params(s, ss)
 
 
 def get_params_gcp(eps: float, ls: Array2DFloat) -> Params:
-    # GCP feasibility: t < eps / gamma (sigma fixed to 1, WLOG).
-    t_candidates = np.linspace(0, eps / _GCP_GAMMA, 150)
-    t, s, _, ss = optimize_params_gcp(eps, _GCP_GAMMA, t_candidates, ls)
-    return Params(t, s, ss)
+    # Fixed, data-independent t (balanced split of the feasibility cap
+    # eps/gamma); sigma fixed to 1, WLOG. See get_params_tdist.
+    fixed_t = 0.5 * eps / _GCP_GAMMA
+    _, s, _, ss = optimize_params_gcp(eps, _GCP_GAMMA, np.array([fixed_t]), ls)
+    return Params(s, ss)
 
 
 def get_params_lcp(eps: float, ls: Array2DFloat) -> Params:
-    # LCP feasibility: t < eps / gamma (sigma fixed to 1, WLOG).
-    t_candidates = np.linspace(0, eps / _LCP_GAMMA, 150)
-    t, s, _, ss = optimize_params_lcp(eps, _LCP_GAMMA, t_candidates, ls)
-    return Params(t, s, ss)
+    # Fixed, data-independent t (balanced split of the feasibility cap
+    # eps/gamma); sigma fixed to 1, WLOG. See get_params_tdist.
+    fixed_t = 0.5 * eps / _LCP_GAMMA
+    _, s, _, ss = optimize_params_lcp(eps, _LCP_GAMMA, np.array([fixed_t]), ls)
+    return Params(s, ss)
 
 
 def broadcast_params(params: Params, size: int) -> Params:
@@ -100,7 +112,6 @@ def broadcast_params(params: Params, size: int) -> Params:
         return np.full(size, float(arr[0]), dtype=np.float64)
 
     return Params(
-        np.full(size, float(params.t[0]), dtype=np.float64),
         _fill(params.s),
         np.full(size, float(params.ss[0]), dtype=np.float64),
     )
@@ -331,7 +342,7 @@ def _esnm_params(m_name: str, setup: Setup, eps: float) -> Params:
 
 def _esnm_pmf(m_name: str, u: np.ndarray, params: Params) -> np.ndarray:
     if m_name == "tdist":
-        return esnm_t_pmf(u, params.ss, params.s, 3.0)
+        return esnm_t_pmf(u, params.ss, params.s, _TDIST_DF)
     if m_name == "gcp":
         return esnm_gcp_pmf(u, params.ss, params.s, _GCP_GAMMA)
     return esnm_lcp_pmf(u, params.ss, params.s, _LCP_GAMMA)

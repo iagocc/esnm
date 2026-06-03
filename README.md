@@ -14,21 +14,20 @@ A high-performance implementation of the **Element Smooth Noisy Max (eSNM)** mec
 
 ## Overview
 
-eSNM introduces two noise-based variants for private selection:
+eSNM introduces several noise-based variants for private selection:
 
 - **eSNM-T** -- Uses Student's t-distribution noise, with per-element smooth sensitivity scaling.
-- **eSNM-LLN** -- Uses Log-Laplace noise, offering robustness for elements with extreme local sensitivities.
+- **eSNM-GCP** -- Uses Gaussian-core Pareto-tail noise.
+- **eSNM-LCP** -- Uses Laplace-core Pareto-tail noise.
 
-Both variants automatically calibrate noise on a per-element basis using smooth sensitivity, improving utility over global-sensitivity methods such as Report Noisy Max and the Exponential Mechanism.
+All variants automatically calibrate noise on a per-element basis using smooth sensitivity, improving utility over global-sensitivity methods such as Report Noisy Max and the Exponential Mechanism.
 
-The repository includes four experiment suites that reproduce the paper's empirical evaluation:
+The repository includes two experiment suites that reproduce the paper's empirical evaluation:
 
 | Experiment | Script | Domain |
 |---|---|---|
 | Top-K Selection | `src/exp_topk.py` | Count-based rankings (games, books, movies) |
-| Egocentric Betweenness Centrality | `src/exp_ebc.py` | Influential node identification in social networks |
 | Percentile Estimation | `src/exp_percentile.py` | High-percentile queries on 1-D data |
-| Private Decision Trees | `src/exp_tree.py` | Differentially private ID3 attribute selection |
 
 ## System Requirements
 
@@ -80,7 +79,7 @@ uv pip install --no-build-isolation -ve .
 3. **Verify the installation:**
 
 ```python
-uv run python -c "from esnm.mechanism import esnm_t, esnm_lln; print('Build OK')"
+uv run python -c "from esnm.mechanism import esnm_t_pmf; from esnm.percentile import get_ls; print('Build OK')"
 ```
 
 ## Running the Experiments
@@ -91,27 +90,17 @@ All experiment scripts are located under `src/` and should be run from the **rep
 # Top-K Selection (games, books, movies)
 python src/exp_topk.py
 
-# Egocentric Betweenness Centrality (enron, dblp, github)
-python src/exp_ebc.py
-
 # Percentile Estimation (hepth, income, patent)
 python src/exp_percentile.py
-
-# Private Decision Trees (adult, nltcs, acs)
-python src/exp_tree.py
 ```
 
-Results are written to the corresponding subdirectory under `results/` (e.g., `results/topk/`, `results/ebc/`).
+Results are written to the corresponding subdirectory under `results/` (e.g., `results/topk/`, `results/percentile/`).
 
 ### Experiment details
 
-**`exp_topk.py`** -- Compares the joint exponential mechanism baseline against eSNM-T and eSNM-LLN for top-k count selection. Reports L1 error, L-infinity error, and NDCG across varying k values at epsilon = 1.0 over 50 trials.
+**`exp_topk.py`** -- Compares the joint exponential mechanism baseline against eSNM-T, eSNM-GCP, and eSNM-LCP for top-k count selection. All methods are pure eps-DP and receive the budget directly (no zCDP conversion). Reports L1 error, L-infinity error, and NDCG across varying k values at a pure-DP epsilon = 1.0 over 50 trials.
 
-**`exp_ebc.py`** -- Evaluates multiple differentially private mechanisms (Report Noisy Max, Local Dampening, Shifted Local Dampening, eSNM-T, eSNM-LLN) for identifying the top-k most influential nodes in social network graphs. Sweeps epsilon in logspace and reports accuracy (overlap with the true top-k).
-
-**`exp_percentile.py`** -- Tests eSNM-T and eSNM-LLN for privately estimating high percentiles (e.g., 99th) on 1-D datasets. Uses precomputed local sensitivity matrices stored in `states/`.
-
-**`exp_tree.py`** -- Builds differentially private ID3 decision trees using eSNM and Local Dampening for attribute selection at each split. Evaluates classification accuracy via 10-fold cross-validation with varying tree depths and privacy budgets.
+**`exp_percentile.py`** -- Benchmarks eSNM-T, eSNM-GCP, and eSNM-LCP against Local Dampening, Shifted Local Dampening, and ShiftedInverse for privately estimating percentiles on 1-D datasets, over a pure eps-DP budget sweep. Uses precomputed local sensitivity matrices stored in `states/`.
 
 ## Project Structure
 
@@ -125,7 +114,8 @@ eSNM/
 │   ├── mechanism.cpp               # Core eSNM mechanisms (C++, nanobind bindings)
 │   │
 │   ├── distributions/
-│   │   ├── lln.h / lln.cpp         # Log-Laplace Noise distribution (PDF/CDF)
+│   │   ├── gcp.h                   # Gaussian-core Pareto-tail noise (PDF/survival)
+│   │   ├── lcp.h                   # Laplace-core Pareto-tail noise (PDF/survival)
 │   │   └── prng.h / prng.cpp       # xoshiro256++ PRNG
 │   │
 │   ├── esnm/                       # Python package (compiled modules installed here)
@@ -135,40 +125,26 @@ eSNM/
 │   ├── standard_selection.py       # Baseline mechanisms (Report Noisy Max, EM)
 │   ├── local_dampening.py          # Local Dampening mechanism
 │   │
+│   ├── shifted_inverse.py          # ShiftedInverse percentile sampler (baseline)
+│   │
 │   ├── topk/                       # Top-K selection module
 │   │   ├── esnm_joint.py           # eSNM adapted for joint top-k
-│   │   ├── joint.py                # Joint exponential mechanism
-│   │   └── utility.py              # Ranking utilities
-│   │
-│   ├── ebc/                        # Egocentric Betweenness Centrality module
-│   │   ├── ebc_metric.py           # EBC computation (Numba-accelerated)
-│   │   ├── graph.py                # Graph loading and adjacency utilities
-│   │   └── sensitivity.py          # Local/global sensitivity for EBC
+│   │   └── joint.py                # Joint exponential mechanism
 │   │
 │   ├── percentile/
 │   │   └── percentile.cpp          # Percentile computation (C++, nanobind)
 │   │
-│   ├── decision_tree/
-│   │   ├── id3.py                  # Differentially private ID3 algorithm
-│   │   └── candidates.py           # Local sensitivity for candidate attributes
-│   │
 │   ├── exp_topk.py                 # Experiment: Top-K selection
-│   ├── exp_ebc.py                  # Experiment: Influential node analysis
-│   ├── exp_percentile.py           # Experiment: Percentile estimation
-│   └── exp_tree.py                 # Experiment: Private decision trees
+│   └── exp_percentile.py           # Experiment: Percentile estimation
 │
 ├── data/
-│   ├── graph/                      # Social network edge lists (enron, dblp, github)
 │   ├── topk/                       # Count datasets (games, books, movies)
-│   ├── tree/                       # Classification datasets (adult, nltcs, acs)
 │   └── 1D/                         # 1-D numeric arrays for percentile experiments
 │
-├── states/                         # Precomputed local sensitivity matrices (.npz)
-├── results/                        # Experiment output (CSV files per experiment)
-│   ├── ebc/
+├── states/                         # Precomputed local sensitivity matrices (.npy)
+├── results/                        # Experiment output (TSV files per experiment)
 │   ├── topk/
-│   ├── percentile/
-│   └── tree/
+│   └── percentile/
 ```
 
 ## Citation

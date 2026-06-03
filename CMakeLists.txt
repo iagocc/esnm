@@ -52,17 +52,10 @@ nanobind_add_module(
   src/mechanism.cpp
   src/distributions/prng.cpp
 )
-nanobind_add_module(
-  dist_lln
-  STABLE_ABI
-  NB_STATIC
-  src/distributions/lln.cpp
-)
 
 find_package(GSL REQUIRED)
 include_directories(${GSL_INCLUDE_DIRS})
 link_directories(${GSL_LIBRARY_DIRS})
 target_link_libraries(mechanism PRIVATE GSL::gsl GSL::gslcblas OpenMP::OpenMP_CXX)
-target_link_libraries(dist_lln PRIVATE GSL::gsl GSL::gslcblas)
 
-install(TARGETS percentile mechanism dist_lln LIBRARY DESTINATION ${PROJECT_NAME})
+install(TARGETS percentile mechanism LIBRARY DESTINATION ${PROJECT_NAME})
